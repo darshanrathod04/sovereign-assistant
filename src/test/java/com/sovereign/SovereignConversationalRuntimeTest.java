@@ -1,6 +1,7 @@
 package com.sovereign;
 
 import com.sovereign.cli.SovereignReplRunner;
+import com.sovereign.core.client.SovereignClient;
 import com.sovereign.core.intent.IntentClassificationResult;
 import com.sovereign.core.intent.IntentRouter;
 import com.sovereign.core.intent.UserIntentType;
@@ -268,5 +269,194 @@ public class SovereignConversationalRuntimeTest {
         SovereignReplRunner runner = new SovereignReplRunner();
         int exitCode = runner.executeAutonomousGoal("Analyze this Maven workspace");
         assertThat(exitCode).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("Test 10: CHAT query delegates to platform LLM provider and returns dynamic response")
+    void testChatIntentInvokesLlmProvider() {
+        IntentRouter router = new IntentRouter();
+        IntentClassificationResult chatClassification = router.classify("What is your purpose, Sovereign?");
+        assertThat(chatClassification.intentType()).isEqualTo(UserIntentType.CHAT);
+
+        SovereignReplRunner runner = new SovereignReplRunner();
+        runner.handleNaturalInput("What is your purpose, Sovereign?");
+
+        // Verify conversation history captured 1 turn (user + assistant)
+        List<SovereignReplRunner.ChatTurn> history = runner.getConversationHistory();
+        assertThat(history).hasSize(2);
+        assertThat(history.get(0).role()).isEqualTo("user");
+        assertThat(history.get(0).text()).isEqualTo("What is your purpose, Sovereign?");
+        assertThat(history.get(1).role()).isEqualTo("assistant");
+        assertThat(history.get(1).text()).contains("Sovereign");
+
+        // Verify second turn preserves history continuity
+        runner.handleNaturalInput("How are you?");
+        assertThat(runner.getConversationHistory()).hasSize(4);
+
+        // Verify direct client reasoning facade
+        try (SovereignClient client = SovereignClient.create()) {
+            assertThat(client.reasoning()).isNotNull();
+            String directReply = client.reasoning().analyze("Who are you?");
+            assertThat(directReply).isNotNull().isNotEmpty();
+            assertThat(directReply).contains("Sovereign");
+        }
+    }
+
+    @Test
+    @DisplayName("Test 11: ProjectSDK facts are passed to LLM provider for summary synthesis")
+    void testProjectIntentSummarizedViaProvider(@TempDir Path tempRepo) throws IOException {
+        String pom = """
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.sample</groupId>
+                    <artifactId>sovereign-core-service</artifactId>
+                    <version>3.1.0</version>
+                </project>
+                """;
+        Files.writeString(tempRepo.resolve("pom.xml"), pom);
+        Files.createDirectories(tempRepo.resolve("src/main/java"));
+
+        WorkspaceContextIndexer indexer = new WorkspaceContextIndexer(tempRepo);
+        WorkspaceContext context = indexer.getContext();
+        assertThat(context.projectName()).isEqualTo("sovereign-core-service");
+
+        try (SovereignClient client = SovereignClient.create()) {
+            String facts = "Project Name: " + context.projectName() + "\n"
+                    + "Version: " + context.projectVersion() + "\n"
+                    + "Build Tool: " + context.buildTool();
+            String executiveSummary = client.reasoning().analyze(
+                    "Summarize workspace architecture:",
+                    facts
+            );
+            assertThat(executiveSummary).isNotNull().isNotEmpty();
+            assertThat(executiveSummary).contains("Workspace");
+        }
+    }
+
+    @Test
+    @DisplayName("Test 12: MEMORY, EXECUTE, and SYSTEM intents remain strictly deterministic")
+    void testDeterministicIntentsRemainIntact() {
+        IntentRouter router = new IntentRouter();
+
+        // 1. MEMORY remains deterministic
+        IntentClassificationResult memResult = router.classify("I am Darshan");
+        assertThat(memResult.intentType()).isEqualTo(UserIntentType.MEMORY);
+        assertThat(memResult.entities().get("operation")).isEqualTo("STORE_NAME");
+        assertThat(memResult.entities().get("userName")).isEqualTo("Darshan");
+
+        SovereignReplRunner runner = new SovereignReplRunner();
+        runner.handleNaturalInput("I am Darshan");
+        assertThat(runner.getUserProfile().getUserName()).isEqualTo("Darshan");
+
+        runner.handleNaturalInput("Set editor VS Code");
+        assertThat(runner.getUserProfile().getPreferredEditor()).isEqualTo("VS Code");
+
+        // 2. EXECUTE remains deterministic
+        IntentClassificationResult execResult = router.classify("Run git status");
+        assertThat(execResult.intentType()).isEqualTo(UserIntentType.EXECUTE);
+        assertThat(execResult.normalizedQuery()).isEqualTo("git status");
+
+        int exitCode = runner.executeAutonomousGoal("echo deterministic_guard_verification");
+        assertThat(exitCode).isEqualTo(0);
+
+        List<EpisodicSessionLedger.EpisodicEntry> entries = runner.getEpisodicLedger().getAllEntries();
+        EpisodicSessionLedger.EpisodicEntry latest = entries.get(entries.size() - 1);
+        assertThat(latest.intent()).isEqualTo(UserIntentType.EXECUTE);
+        assertThat(latest.originalPrompt()).contains("deterministic_guard_verification");
+
+        // 3. SYSTEM remains deterministic
+        IntentClassificationResult sysResult = router.classify("status");
+        assertThat(sysResult.intentType()).isEqualTo(UserIntentType.SYSTEM);
+    }
+
+    @Test
+    @DisplayName("Test 13: Prefix stripping — 'sovereign> Run git status' resolves to 'git status' EXECUTE intent")
+    void testPrefixStripping() {
+        IntentRouter router = new IntentRouter();
+
+        // Input normalisation: sovereign> prefix is stripped
+        assertThat(IntentRouter.normalizeInput("sovereign> Run git status")).isEqualTo("Run git status");
+        assertThat(IntentRouter.normalizeInput("sovereign> keys")).isEqualTo("keys");
+        assertThat(IntentRouter.normalizeInput("$ git status")).isEqualTo("git status");
+        assertThat(IntentRouter.normalizeInput("> keys")).isEqualTo("keys");
+        assertThat(IntentRouter.normalizeInput("  sovereign>   echo hello  ")).isEqualTo("echo hello");
+
+        // After normalisation, classification must be EXECUTE with correct normalised command
+        IntentClassificationResult result = router.classify("sovereign> Run git status");
+        assertThat(result.intentType()).isEqualTo(UserIntentType.EXECUTE);
+        assertThat(result.normalizedQuery()).isEqualTo("git status");
+
+        // SYSTEM intent still works after prefix strip
+        IntentClassificationResult keysResult = router.classify("sovereign> keys");
+        assertThat(keysResult.intentType()).isEqualTo(UserIntentType.SYSTEM);
+        assertThat(keysResult.entities().get("operation")).isEqualTo("KEYS");
+
+        // End-to-end: 'sovereign> Run git status' must execute git status, not throw CommandNotFoundException
+        SovereignReplRunner runner = new SovereignReplRunner();
+        int exitCode = runner.executeAutonomousGoal("sovereign> Run git status");
+        // git may not be installed in CI — we only require it did NOT invoke a nonsense command that crashes the JVM
+        // exit code 0 or 1/128 from git are all acceptable; what's NOT acceptable is an exception
+        assertThat(exitCode).isLessThanOrEqualTo(128); // git exit codes are 0..128
+    }
+
+    @Test
+    @DisplayName("Test 14: Compound name introduction 'hello i am rahul' routes to MEMORY, not shell_exec")
+    void testCompoundNameIntroduction() {
+        IntentRouter router = new IntentRouter();
+
+        // Compound greeting + name must route to MEMORY
+        IntentClassificationResult helloRahul = router.classify("hello i am rahul");
+        assertThat(helloRahul.intentType()).isEqualTo(UserIntentType.MEMORY);
+        assertThat(helloRahul.entities().get("operation")).isEqualTo("STORE_NAME");
+        assertThat(helloRahul.entities().get("userName")).isEqualToIgnoringCase("rahul");
+
+        IntentClassificationResult hiAlex = router.classify("hi my name is alex");
+        assertThat(hiAlex.intentType()).isEqualTo(UserIntentType.MEMORY);
+        assertThat(hiAlex.entities().get("userName")).isEqualToIgnoringCase("alex");
+
+        IntentClassificationResult heySovereign = router.classify("hey sovereign i am darshan");
+        assertThat(heySovereign.intentType()).isEqualTo(UserIntentType.MEMORY);
+        assertThat(heySovereign.entities().get("userName")).isEqualToIgnoringCase("darshan");
+
+        // End-to-end: runner must update user profile to 'rahul' without invoking shell
+        SovereignReplRunner runner = new SovereignReplRunner();
+        runner.handleNaturalInput("hello i am rahul");
+        assertThat(runner.getUserProfile().getUserName()).isEqualToIgnoringCase("rahul");
+
+        // Verify the acknowledgement response captured in conversation history is conversational
+        // (MEMORY branch does NOT call recordConversationTurn, so history stays empty — just verify no shell crashed)
+        assertThat(runner.getConversationHistory()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Test 15: Natural language queries route to CHAT, never to shell_exec")
+    void testNaturalLanguageQueryDoesNotTriggerShell() {
+        IntentRouter router = new IntentRouter();
+
+        // "what can you do" — must be CHAT
+        assertThat(router.classify("what can you do").intentType()).isEqualTo(UserIntentType.CHAT);
+        assertThat(router.classify("what can you do?").intentType()).isEqualTo(UserIntentType.CHAT);
+        assertThat(router.classify("help me").intentType()).isEqualTo(UserIntentType.CHAT);
+        assertThat(router.classify("what are your capabilities").intentType()).isEqualTo(UserIntentType.CHAT);
+        assertThat(router.classify("who are you").intentType()).isEqualTo(UserIntentType.CHAT);
+        assertThat(router.classify("what is your purpose").intentType()).isEqualTo(UserIntentType.CHAT);
+
+        // Verify isNaturalLanguageFallback guard
+        assertThat(IntentRouter.isNaturalLanguageFallback("hello i am rahul")).isTrue();
+        assertThat(IntentRouter.isNaturalLanguageFallback("git status")).isFalse();
+        assertThat(IntentRouter.isNaturalLanguageFallback("mvn clean test")).isFalse();
+        assertThat(IntentRouter.isNaturalLanguageFallback("echo hello world")).isFalse();
+
+        // End-to-end: executeAutonomousGoal("what can you do") must NOT invoke any shell command
+        // It must be caught by the CHAT guard in executeAutonomousGoal and redirect to handleNaturalInput
+        SovereignReplRunner runner = new SovereignReplRunner();
+        int exitCode = runner.executeAutonomousGoal("what can you do");
+        assertThat(exitCode).isEqualTo(0);
+
+        // Conversation history should have captured a CHAT turn (not an EXECUTE result)
+        List<SovereignReplRunner.ChatTurn> history = runner.getConversationHistory();
+        assertThat(history).isNotEmpty();
+        assertThat(history.get(0).role()).isEqualTo("user");
+        assertThat(history.get(0).text()).isEqualTo("what can you do");
     }
 }

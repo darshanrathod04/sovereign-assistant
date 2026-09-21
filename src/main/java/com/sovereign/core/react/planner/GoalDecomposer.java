@@ -281,8 +281,16 @@ public class GoalDecomposer {
             return new ToolBinding("process_list", Map.of("filter", filter));
         }
 
-        // 7. Generic Shell execution with normalized command
-        return new ToolBinding("shell_exec", Map.of("command", normalized.isEmpty() ? intent : normalized));
+        // 7. Generic Shell execution with normalized command.
+        //    Guard: if the input looks like natural language (no known shell token),
+        //    reroute to a safe no-op echo that surfaces back to the operator as a
+        //    conversational hint rather than triggering an OS command.
+        String finalCmd = normalized.isEmpty() ? intent : normalized;
+        if (IntentRouter.isNaturalLanguageFallback(finalCmd)) {
+            // Safe fallback: inform instead of executing arbitrary NL text as a shell command
+            return new ToolBinding("shell_exec", Map.of("command", "echo \"[SOVEREIGN] Input interpreted as natural language: " + finalCmd.replace("\"", "'") + "\""));
+        }
+        return new ToolBinding("shell_exec", Map.of("command", finalCmd));
     }
 
     private boolean isRecognizedShellCommand(String cmd) {

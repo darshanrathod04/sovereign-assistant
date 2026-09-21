@@ -1,5 +1,7 @@
 package com.sovereign.core.voice;
 
+import com.sovereign.core.config.ProviderConfig;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -16,8 +18,10 @@ import java.util.concurrent.TimeUnit;
  * <b>SpeechToTextAdapter</b>
  *
  * <p>Transcribes audio input streams, WAV/PCM buffers, and audio files into text prompts.
- * Provides integration with local Whisper/System STT CLI when available, with deterministic
- * mock and in-memory fallbacks for automated testing and headless environments.</p>
+ * For real microphone audio, delegates to {@link AudioTranscriptionService} which provides
+ * a three-tier cascade: Gemini Multimodal STT → local Whisper CLI → Windows SAPI.
+ * Mock audio (used in tests) is handled via the embedded {@code MOCK_AUDIO:} prefix protocol.
+ * A heuristic fallback is used when all real transcription tiers fail.</p>
  */
 public class SpeechToTextAdapter {
 
@@ -27,12 +31,23 @@ public class SpeechToTextAdapter {
     private final VoiceConfig config;
     private final ConcurrentMap<String, String> registeredMockTranscripts = new ConcurrentHashMap<>();
 
+    /** Real audio transcription service (Gemini → Whisper → SAPI). */
+    private final AudioTranscriptionService transcriptionService;
+
     public SpeechToTextAdapter() {
         this(VoiceConfig.defaultConfig());
     }
 
     public SpeechToTextAdapter(VoiceConfig config) {
         this.config = config != null ? config : VoiceConfig.defaultConfig();
+        this.transcriptionService = new AudioTranscriptionService(ProviderConfig.load());
+    }
+
+    /** Constructor with explicit ProviderConfig — used by SovereignClient and tests. */
+    public SpeechToTextAdapter(VoiceConfig config, ProviderConfig providerConfig) {
+        this.config = config != null ? config : VoiceConfig.defaultConfig();
+        this.transcriptionService = new AudioTranscriptionService(
+                providerConfig != null ? providerConfig : ProviderConfig.load());
     }
 
     /**
@@ -48,38 +63,36 @@ public class SpeechToTextAdapter {
 
     /**
      * Transcribes an audio byte array.
+     *
+     * <p>Priority:</p>
+     * <ol>
+     *   <li>Mock audio protocol ({@code MOCK_AUDIO:} prefix) — for testing</li>
+     *   <li>{@link AudioTranscriptionService} cascade: Gemini → Whisper → Windows SAPI</li>
+     *   <li>Legacy heuristic fallback (offline, no mic services available)</li>
+     * </ol>
      */
     public String transcribe(byte[] audioData) throws IOException {
         if (audioData == null || audioData.length == 0) {
             return "";
         }
 
-        // 1. Check for registered audio signatures or mock payload
+        // 1. Check for registered audio signatures or mock payload (test infrastructure)
         String detectedMock = extractMockTranscription(audioData);
         if (detectedMock != null) {
             return detectedMock;
         }
 
-        // 2. If whisper engine is requested and available, attempt local CLI transcription
-        if ("whisper".equalsIgnoreCase(config.getSttEngine()) && isWhisperCliAvailable()) {
-            try {
-                Path tempAudio = Files.createTempFile("sovereign_audio_", ".wav");
-                try {
-                    Files.write(tempAudio, audioData);
-                    String result = transcribeWithLocalWhisper(tempAudio);
-                    if (result != null && !result.isBlank()) {
-                        return result;
-                    }
-                } finally {
-                    Files.deleteIfExists(tempAudio);
-                }
-            } catch (Exception e) {
-                // Fallback on CLI failure
+        // 2. Real audio: delegate to AudioTranscriptionService (Gemini → Whisper → SAPI)
+        //    Only skip if audio is clearly too small to be a real WAV with speech
+        if (audioData.length >= 44) {
+            String realTranscript = transcriptionService.transcribeWav(audioData);
+            if (realTranscript != null) {
+                return realTranscript; // includes "[SILENCE]" for inaudible audio
             }
         }
 
-        // 3. Fallback transcription heuristic
-        return "Transcribed audio buffer (" + audioData.length + " bytes)";
+        // 3. Last-resort heuristic (no cloud key, no whisper, non-Windows) — signal offline
+        return AudioTranscriptionService.SILENCE_MARKER;
     }
 
     /**

@@ -8,9 +8,11 @@ import com.shreeai.os.platform.sdk.MemorySDK;
 import com.shreeai.os.platform.sdk.PlanningSDK;
 import com.shreeai.os.platform.sdk.ShreeAI;
 import com.shreeai.os.platform.sdk.ProjectSDK;
+import com.sovereign.core.config.ProviderConfig;
 import com.sovereign.core.sdk.DeveloperSDK;
 import com.sovereign.core.sdk.ReasoningSDK;
 
+import java.util.Objects;
 import java.util.logging.Logger;
 
 /**
@@ -32,12 +34,14 @@ public class SovereignClient implements AutoCloseable {
     private final ReasoningSDK reasoningSdk;
     private final DeveloperSDK developerSdk;
     private final ProjectSDK projectSdk;
+    private final ProviderConfig providerConfig;
 
     private SovereignClient(DefaultRuntimeService runtimeService,
                             ShreePlatformRuntime platformRuntime,
                             ShreeAI shreeAI,
                             ReasoningSDK reasoningSdk,
-                            DeveloperSDK developerSdk) {
+                            DeveloperSDK developerSdk,
+                            ProviderConfig providerConfig) {
         this.runtimeService = runtimeService;
         this.platformRuntime = platformRuntime;
         this.shreeAI = shreeAI;
@@ -46,6 +50,7 @@ public class SovereignClient implements AutoCloseable {
         this.reasoningSdk = reasoningSdk;
         this.developerSdk = developerSdk;
         this.projectSdk = shreeAI.project();
+        this.providerConfig = providerConfig;
     }
 
     /**
@@ -56,26 +61,26 @@ public class SovereignClient implements AutoCloseable {
     }
 
     /**
-     * Bootstraps a new {@link SovereignClient} instance with deterministic fallback for unset API keys.
+     * Bootstraps a new {@link SovereignClient} instance with resolved credentials.
      */
     public static SovereignClient createDefault() {
-        // Resolve API keys or establish deterministic fallback
-        String geminiKey = resolveEnvOrProperty("GEMINI_API_KEY", "gemini.api.key");
-        String openAiKey = resolveEnvOrProperty("OPENAI_API_KEY", "openai.api.key");
+        return create(ProviderConfig.load());
+    }
 
-        String apiKey;
-        if (geminiKey != null && !geminiKey.isBlank()) {
-            apiKey = geminiKey;
-        } else if (openAiKey != null && !openAiKey.isBlank()) {
-            apiKey = openAiKey;
-        } else {
-            // Fallback deterministic provider (in-memory)
-            apiKey = "deterministic-fallback-key";
-            if (System.getProperty("shree.llm.chain") == null) {
-                System.setProperty("shree.llm.chain", "in-memory");
-            }
-            LOGGER.info("No LLM API keys detected; utilizing deterministic in-memory provider.");
-        }
+    /**
+     * Bootstraps a new {@link SovereignClient} instance with explicit {@link ProviderConfig}.
+     */
+    public static SovereignClient create(ProviderConfig providerConfig) {
+        Objects.requireNonNull(providerConfig, "providerConfig must not be null");
+
+        // 1. Dynamically apply system properties and active LLM chain
+        providerConfig.applySystemProperties();
+
+        // 2. Display executive JARVIS neural link startup banner
+        System.out.println(providerConfig.getBanner());
+
+        // 3. Resolve client facade bootstrap key
+        String apiKey = providerConfig.resolvePrimaryApiKey();
 
         // Configure RuntimeConfiguration and RuntimeContract
         RuntimeConfiguration configuration = RuntimeConfiguration.builder()
@@ -105,22 +110,14 @@ public class SovereignClient implements AutoCloseable {
                 .runtime(runtimeService)
                 .build();
 
-        ReasoningSDK reasoningSdk = new ReasoningSDK();
+        ReasoningSDK reasoningSdk = new ReasoningSDK(
+                new com.shreeai.os.platform.kernels.cognitive.engine.DefaultReasoningEngine(),
+                shreeAI,
+                runtimeService
+        );
         DeveloperSDK developerSdk = new DeveloperSDK();
 
-        return new SovereignClient(runtimeService, platformRuntime, shreeAI, reasoningSdk, developerSdk);
-    }
-
-    private static String resolveEnvOrProperty(String envName, String propName) {
-        String envVal = System.getenv(envName);
-        if (envVal != null && !envVal.isBlank()) {
-            return envVal;
-        }
-        String propVal = System.getProperty(propName);
-        if (propVal != null && !propVal.isBlank()) {
-            return propVal;
-        }
-        return null;
+        return new SovereignClient(runtimeService, platformRuntime, shreeAI, reasoningSdk, developerSdk, providerConfig);
     }
 
     public ShreePlatformRuntime getPlatformRuntime() {
@@ -147,12 +144,20 @@ public class SovereignClient implements AutoCloseable {
         return reasoningSdk;
     }
 
+    public ReasoningSDK reasoning() {
+        return reasoningSdk;
+    }
+
     public DeveloperSDK getDeveloperSdk() {
         return developerSdk;
     }
 
     public ProjectSDK getProjectSdk() {
         return projectSdk;
+    }
+
+    public ProviderConfig getProviderConfig() {
+        return providerConfig;
     }
 
     public boolean isInitialized() {
