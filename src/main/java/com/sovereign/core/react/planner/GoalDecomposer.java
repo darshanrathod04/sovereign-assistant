@@ -2,9 +2,13 @@ package com.sovereign.core.react.planner;
 
 import com.shreeai.os.platform.sdk.PlanningSDK;
 import com.shreeai.os.platform.sdk.SDKResponse;
+import com.sovereign.core.memory.ProceduralSkillStore;
+import com.sovereign.core.memory.UserMemoryProfile;
 import com.sovereign.core.react.model.ExecutionPlan;
 import com.sovereign.core.react.model.GoalTask;
 import com.sovereign.core.react.model.PlanStep;
+import com.sovereign.core.workspace.WorkspaceContext;
+import com.sovereign.core.workspace.WorkspaceContextIndexer;
 
 import java.util.*;
 import java.util.regex.Matcher;
@@ -13,19 +17,37 @@ import java.util.regex.Pattern;
 /**
  * <b>GoalDecomposer</b>
  *
- * <p>Cognitive task planner leveraging Shree AI OS {@link PlanningSDK} to break down
- * high-level user goals into structured DAG execution plans bound to Host OS tools.</p>
+ * <p>Cognitive task planner leveraging Shree AI OS {@link PlanningSDK}, repository
+ * context from {@link WorkspaceContextIndexer}, and user memory to break down
+ * high-level user goals into structured DAG execution plans.</p>
  */
 public class GoalDecomposer {
 
     private final PlanningSDK planningSdk;
+    private final WorkspaceContextIndexer contextIndexer;
+    private final UserMemoryProfile userProfile;
+    private final ProceduralSkillStore skillStore;
 
     public GoalDecomposer() {
-        this(null);
+        this(null, null, null, null);
     }
 
     public GoalDecomposer(PlanningSDK planningSdk) {
+        this(planningSdk, null, null, null);
+    }
+
+    public GoalDecomposer(PlanningSDK planningSdk, WorkspaceContextIndexer contextIndexer) {
+        this(planningSdk, contextIndexer, null, null);
+    }
+
+    public GoalDecomposer(PlanningSDK planningSdk,
+                          WorkspaceContextIndexer contextIndexer,
+                          UserMemoryProfile userProfile,
+                          ProceduralSkillStore skillStore) {
         this.planningSdk = planningSdk;
+        this.contextIndexer = contextIndexer;
+        this.userProfile = userProfile;
+        this.skillStore = skillStore;
     }
 
     /**
@@ -34,21 +56,37 @@ public class GoalDecomposer {
     public ExecutionPlan decompose(GoalTask goalTask) {
         Objects.requireNonNull(goalTask, "GoalTask must not be null");
 
+        String effectiveGoal = goalTask.description();
+
+        // 1. Resolve custom alias from UserMemoryProfile
+        if (userProfile != null) {
+            Optional<String> aliased = userProfile.getAlias(effectiveGoal);
+            if (aliased.isPresent()) {
+                effectiveGoal = aliased.get();
+            }
+        }
+
+        // 2. Resolve procedural skill from ProceduralSkillStore
+        if (skillStore != null) {
+            Optional<ProceduralSkillStore.SkillDefinition> skill = skillStore.getSkill(effectiveGoal);
+            if (skill.isPresent()) {
+                effectiveGoal = skill.get().recipe();
+            }
+        }
+
         // Engage Shree AI OS PlanningSDK for cognitive plan creation
         if (planningSdk != null) {
             try {
                 SDKResponse response = planningSdk.createPlan(
                         goalTask.id(),
-                        goalTask.description(),
+                        effectiveGoal,
                         "Host OS ReAct Tooling Engine"
                 );
-                // PlanningSDK records and validates the intent through the cognitive kernel
             } catch (Exception ignored) {
-                // Keep deterministic fallback active if PlanningSDK backend is offline
             }
         }
 
-        List<PlanStep> steps = decomposeIntoSteps(goalTask.description());
+        List<PlanStep> steps = decomposeIntoSteps(effectiveGoal);
         return ExecutionPlan.of(goalTask.id(), steps);
     }
 
@@ -175,8 +213,21 @@ public class GoalDecomposer {
     private record ToolBinding(String toolName, Map<String, Object> parameters) {}
 
     private ToolBinding matchTool(String intent) {
-        String lower = intent.toLowerCase();
+        String lower = intent.toLowerCase().trim();
         boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+
+        // 0. Ambiguous build/test goals resolved via WorkspaceContext
+        if (lower.equals("run tests") || lower.equals("test the app") || lower.equals("run test suite")
+                || lower.equals("test") || lower.equals("tests") || lower.contains("run tests")) {
+            String testCmd = contextIndexer != null ? contextIndexer.getContext().getTestCommand() : "mvn test";
+            return new ToolBinding("shell_exec", Map.of("command", testCmd));
+        }
+
+        if (lower.equals("build project") || lower.equals("build the app") || lower.equals("compile project")
+                || lower.equals("build") || lower.equals("compile")) {
+            String buildCmd = contextIndexer != null ? contextIndexer.getContext().getBuildCommand() : "mvn compile";
+            return new ToolBinding("shell_exec", Map.of("command", buildCmd));
+        }
 
         // 1. Directory creation
         if (lower.contains("create") && (lower.contains("directory") || lower.contains("folder") || lower.contains("subfolder"))) {

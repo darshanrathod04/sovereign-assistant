@@ -1,6 +1,9 @@
 package com.sovereign.cli;
 
 import com.sovereign.core.client.SovereignClient;
+import com.sovereign.core.memory.EpisodicSessionLedger;
+import com.sovereign.core.memory.ProceduralSkillStore;
+import com.sovereign.core.memory.UserMemoryProfile;
 import com.sovereign.core.react.engine.AutonomousOperator;
 import com.sovereign.core.react.model.OperatorEvent;
 import com.sovereign.core.react.planner.GoalDecomposer;
@@ -8,6 +11,8 @@ import com.sovereign.core.react.recovery.CausalErrorRecoveryEngine;
 import com.sovereign.core.tools.FileSystemTool;
 import com.sovereign.core.tools.ProcessControlTool;
 import com.sovereign.core.tools.ShellExecutionTool;
+import com.sovereign.core.workspace.WorkspaceContext;
+import com.sovereign.core.workspace.WorkspaceContextIndexer;
 
 import java.util.Scanner;
 
@@ -29,6 +34,12 @@ public class SovereignReplRunner {
     private final ShellExecutionTool shellTool;
     private final FileSystemTool fileSystemTool;
     private final ProcessControlTool processControlTool;
+
+    private final UserMemoryProfile userProfile;
+    private final ProceduralSkillStore skillStore;
+    private final WorkspaceContextIndexer contextIndexer;
+    private EpisodicSessionLedger episodicLedger;
+
     private SovereignClient client;
     private AutonomousOperator autonomousOperator;
 
@@ -36,6 +47,9 @@ public class SovereignReplRunner {
         this.shellTool = new ShellExecutionTool();
         this.fileSystemTool = new FileSystemTool();
         this.processControlTool = new ProcessControlTool();
+        this.userProfile = UserMemoryProfile.createDefault();
+        this.skillStore = ProceduralSkillStore.createDefault();
+        this.contextIndexer = new WorkspaceContextIndexer();
     }
 
     public static void main(String[] args) {
@@ -91,6 +105,32 @@ public class SovereignReplRunner {
             return executeAutonomousGoal(sb.toString().trim());
         }
 
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("memory")) {
+            printMemory();
+            return 0;
+        }
+
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("context")) {
+            printContext();
+            return 0;
+        }
+
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("learn")) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Error: learn requires an assignment expression. Usage: sovereign learn <alias>=<command/goal>");
+                return 1;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = startIndex + 1; i < args.length; i++) {
+                if (!sb.isEmpty()) {
+                    sb.append(" ");
+                }
+                sb.append(args[i]);
+            }
+            handleLearn(sb.toString().trim());
+            return 0;
+        }
+
         if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("repl") || args[startIndex].equalsIgnoreCase("interactive"))) {
             runInteractiveLoop();
             return 0;
@@ -99,6 +139,9 @@ public class SovereignReplRunner {
         System.out.println("Unknown arguments. Usage:");
         System.out.println("  sovereign run \"<goal>\"");
         System.out.println("  sovereign exec \"<command>\"");
+        System.out.println("  sovereign memory");
+        System.out.println("  sovereign context");
+        System.out.println("  sovereign learn <alias>=<goal>");
         System.out.println("  sovereign repl");
         return 1;
     }
@@ -127,7 +170,14 @@ public class SovereignReplRunner {
         System.out.println("\n>>> [SOVEREIGN OPERATOR] Autonomous ReAct Loop Initiated for Goal:");
         System.out.println("    \"" + goal + "\"\n");
 
+        long start = System.currentTimeMillis();
         AutonomousOperator.OperatorResult result = autonomousOperator.execute(goal);
+        long elapsed = System.currentTimeMillis() - start;
+
+        if (episodicLedger != null) {
+            episodicLedger.recordGoal(result, elapsed);
+        }
+
         return result.success() ? 0 : 1;
     }
 
@@ -161,6 +211,12 @@ public class SovereignReplRunner {
                 handleRead(line.substring(5).trim());
             } else if (line.startsWith("write ")) {
                 handleWrite(line.substring(6).trim());
+            } else if (line.equalsIgnoreCase("memory")) {
+                printMemory();
+            } else if (line.equalsIgnoreCase("context")) {
+                printContext();
+            } else if (line.startsWith("learn ")) {
+                handleLearn(line.substring(6).trim());
             } else if (line.equalsIgnoreCase("processes")) {
                 handleProcesses();
             } else if (line.equalsIgnoreCase("status")) {
@@ -184,7 +240,15 @@ public class SovereignReplRunner {
                     System.err.println("Warning: SovereignClient init fallback: " + e.getMessage());
                 }
             }
-            GoalDecomposer decomposer = new GoalDecomposer(client != null ? client.getPlanningSdk() : null);
+            if (episodicLedger == null) {
+                this.episodicLedger = new EpisodicSessionLedger(client != null ? client.getMemorySdk() : null);
+            }
+            GoalDecomposer decomposer = new GoalDecomposer(
+                    client != null ? client.getPlanningSdk() : null,
+                    contextIndexer,
+                    userProfile,
+                    skillStore
+            );
             CausalErrorRecoveryEngine recoveryEngine = new CausalErrorRecoveryEngine(client != null ? client.getReasoningSdk() : null);
             autonomousOperator = new AutonomousOperator(decomposer, recoveryEngine, shellTool, fileSystemTool, processControlTool);
 
@@ -212,6 +276,52 @@ public class SovereignReplRunner {
                 }
             });
         }
+    }
+
+    public void printMemory() {
+        ensureOperator();
+        System.out.println("=== USER MEMORY PROFILE ===");
+        System.out.println("Preferred Shell  : " + userProfile.getPreferredShell());
+        System.out.println("Preferred Editor : " + userProfile.getPreferredEditor());
+        System.out.println("Custom Aliases   : " + userProfile.getCustomAliases());
+        System.out.println("Favorite Projects: " + userProfile.getFavoriteProjects());
+        System.out.println("\n=== EPISODIC GOAL HISTORY ===");
+        var recent = episodicLedger.getRecentGoals(10);
+        if (recent.isEmpty()) {
+            System.out.println("No past goal executions recorded in episodic ledger.");
+        } else {
+            recent.forEach(e -> System.out.printf("  [%s] %s | Success: %s (%dms)%n",
+                    e.goalId(), e.description(), e.success(), e.durationMs()));
+        }
+        System.out.println("\n=== PROCEDURAL SKILLS ===");
+        skillStore.getAllSkills().forEach((name, def) ->
+                System.out.printf("  Skill '%s' -> %s%n", name, def.recipe()));
+    }
+
+    public void printContext() {
+        WorkspaceContext ctx = contextIndexer.getContext();
+        System.out.println("=== WORKSPACE CONTEXT ===");
+        System.out.println("Root Path       : " + ctx.rootPath());
+        System.out.println("Project Name    : " + ctx.projectName());
+        System.out.println("Project Version : " + ctx.projectVersion());
+        System.out.println("Build Tool      : " + ctx.buildTool());
+        System.out.println("Framework       : " + ctx.detectedFramework());
+        System.out.println("Source Dirs     : " + ctx.sourceDirectories());
+        System.out.println("Metadata        : " + ctx.metadata());
+    }
+
+    public void handleLearn(String learnArg) {
+        if (!learnArg.contains("=")) {
+            System.err.println("Usage: learn <alias>=<command/goal>");
+            return;
+        }
+        int eq = learnArg.indexOf('=');
+        String alias = learnArg.substring(0, eq).trim();
+        String recipe = learnArg.substring(eq + 1).trim();
+
+        skillStore.registerSkill(alias, recipe);
+        userProfile.setAlias(alias, recipe);
+        System.out.printf("Successfully learned skill: '%s' -> '%s'%n", alias, recipe);
     }
 
     private void handleRead(String path) {
@@ -268,6 +378,9 @@ public class SovereignReplRunner {
               exec <command>          Execute host OS shell command directly
               read <file>             Read file within workspace boundary
               write <file> <content>  Write file within workspace boundary
+              memory                  List recent episodic goals and active user profile
+              context                 Display detected workspace information
+              learn <alias>=<goal>    Save reusable procedural skill
               processes               List top active processes
               status                  Check Shree AI OS runtime status
               help                    Show this help message
@@ -290,5 +403,22 @@ public class SovereignReplRunner {
     public AutonomousOperator getAutonomousOperator() {
         ensureOperator();
         return autonomousOperator;
+    }
+
+    public UserMemoryProfile getUserProfile() {
+        return userProfile;
+    }
+
+    public EpisodicSessionLedger getEpisodicLedger() {
+        ensureOperator();
+        return episodicLedger;
+    }
+
+    public ProceduralSkillStore getSkillStore() {
+        return skillStore;
+    }
+
+    public WorkspaceContextIndexer getContextIndexer() {
+        return contextIndexer;
     }
 }

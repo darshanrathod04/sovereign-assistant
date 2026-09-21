@@ -7,6 +7,7 @@ import com.shreeai.os.platform.runtime.service.DefaultRuntimeService;
 import com.shreeai.os.platform.sdk.MemorySDK;
 import com.shreeai.os.platform.sdk.PlanningSDK;
 import com.shreeai.os.platform.sdk.ShreeAI;
+import com.shreeai.os.platform.sdk.ProjectSDK;
 import com.sovereign.core.sdk.DeveloperSDK;
 import com.sovereign.core.sdk.ReasoningSDK;
 
@@ -16,7 +17,7 @@ import java.util.logging.Logger;
  * <b>SovereignClient</b>
  *
  * <p>Central client facade initializing and coordinating the Shree AI OS runtime,
- * SDK facades (Planning, Reasoning, Memory, Developer), and host engine services.</p>
+ * SDK facades (Planning, Reasoning, Memory, Developer, Project), and host engine services.</p>
  */
 public class SovereignClient implements AutoCloseable {
 
@@ -30,6 +31,7 @@ public class SovereignClient implements AutoCloseable {
     private final MemorySDK memorySdk;
     private final ReasoningSDK reasoningSdk;
     private final DeveloperSDK developerSdk;
+    private final ProjectSDK projectSdk;
 
     private SovereignClient(DefaultRuntimeService runtimeService,
                             ShreePlatformRuntime platformRuntime,
@@ -43,6 +45,7 @@ public class SovereignClient implements AutoCloseable {
         this.memorySdk = shreeAI.memory();
         this.reasoningSdk = reasoningSdk;
         this.developerSdk = developerSdk;
+        this.projectSdk = shreeAI.project();
     }
 
     /**
@@ -146,6 +149,10 @@ public class SovereignClient implements AutoCloseable {
 
     public DeveloperSDK getDeveloperSdk() {
         return developerSdk;
+    }
+
+    public ProjectSDK getProjectSdk() {
+        return projectSdk;
     }
 
     public boolean isInitialized() {
