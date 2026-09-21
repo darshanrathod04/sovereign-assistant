@@ -11,6 +11,11 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
 
 /**
  * <b>WorkspaceContextIndexer</b>
@@ -81,21 +86,68 @@ public class WorkspaceContextIndexer {
             buildTool = "Maven";
             metadata.put("descriptor", "pom.xml");
             try {
+                DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+                dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+                dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+                dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+                Document doc = dbf.newDocumentBuilder().parse(pomXml.toFile());
+                Element projectElement = doc.getDocumentElement();
+
+                String childArtifactId = null;
+                String childVersion = null;
+                String parentVersion = null;
+
+                NodeList children = projectElement.getChildNodes();
+                for (int i = 0; i < children.getLength(); i++) {
+                    Node node = children.item(i);
+                    if (node.getNodeType() == Node.ELEMENT_NODE) {
+                        String nodeName = node.getNodeName();
+                        if ("artifactId".equals(nodeName)) {
+                            childArtifactId = node.getTextContent().trim();
+                        } else if ("version".equals(nodeName)) {
+                            childVersion = node.getTextContent().trim();
+                        } else if ("parent".equals(nodeName)) {
+                            NodeList parentChildren = node.getChildNodes();
+                            for (int j = 0; j < parentChildren.getLength(); j++) {
+                                Node pChild = parentChildren.item(j);
+                                if (pChild.getNodeType() == Node.ELEMENT_NODE && "version".equals(pChild.getNodeName())) {
+                                    parentVersion = pChild.getTextContent().trim();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (childArtifactId != null && !childArtifactId.isBlank()) {
+                    projectName = childArtifactId;
+                }
+                if (childVersion != null && !childVersion.isBlank()) {
+                    projectVersion = childVersion;
+                } else if (parentVersion != null && !parentVersion.isBlank()) {
+                    projectVersion = parentVersion;
+                }
+
                 String pomContent = Files.readString(pomXml, StandardCharsets.UTF_8);
-                Matcher artifactMatcher = Pattern.compile("<artifactId>(.*?)</artifactId>").matcher(pomContent);
-                if (artifactMatcher.find()) {
-                    projectName = artifactMatcher.group(1).trim();
-                }
-                Matcher versionMatcher = Pattern.compile("<version>(.*?)</version>").matcher(pomContent);
-                if (versionMatcher.find()) {
-                    projectVersion = versionMatcher.group(1).trim();
-                }
                 if (pomContent.contains("spring-boot")) {
                     framework = "Spring Boot";
                 } else {
                     framework = "Java";
                 }
-            } catch (IOException ignored) {
+            } catch (Exception ignored) {
+                // Fallback regex if XML parsing encounters non-standard POM
+                try {
+                    String pomContent = Files.readString(pomXml, StandardCharsets.UTF_8);
+                    String noParent = pomContent.replaceAll("(?s)<parent>.*?</parent>", "");
+                    Matcher artifactMatcher = Pattern.compile("<artifactId>(.*?)</artifactId>").matcher(noParent);
+                    if (artifactMatcher.find()) {
+                        projectName = artifactMatcher.group(1).trim();
+                    }
+                    Matcher versionMatcher = Pattern.compile("<version>(.*?)</version>").matcher(noParent);
+                    if (versionMatcher.find()) {
+                        projectVersion = versionMatcher.group(1).trim();
+                    }
+                } catch (Exception ignored2) {
+                }
             }
 
             // Discover standard Maven source roots

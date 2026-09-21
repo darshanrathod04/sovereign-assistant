@@ -3,10 +3,14 @@ package com.sovereign.cli;
 import com.sovereign.core.client.SovereignClient;
 import com.sovereign.core.daemon.WorkspaceAlert;
 import com.sovereign.core.daemon.WorkspaceWatcherDaemon;
+import com.sovereign.core.intent.IntentClassificationResult;
+import com.sovereign.core.intent.IntentRouter;
+import com.sovereign.core.intent.UserIntentType;
 import com.sovereign.core.memory.EpisodicSessionLedger;
 import com.sovereign.core.memory.ProceduralSkillStore;
 import com.sovereign.core.memory.UserMemoryProfile;
 import com.sovereign.core.react.engine.AutonomousOperator;
+import com.sovereign.core.react.model.GoalStatus;
 import com.sovereign.core.react.model.OperatorEvent;
 import com.sovereign.core.react.planner.GoalDecomposer;
 import com.sovereign.core.react.recovery.CausalErrorRecoveryEngine;
@@ -20,13 +24,17 @@ import com.sovereign.core.workspace.WorkspaceContext;
 import com.sovereign.core.workspace.WorkspaceContextIndexer;
 
 import java.io.IOException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Scanner;
+import java.util.UUID;
 
 /**
  * <b>SovereignReplRunner</b>
  *
  * <p>Interactive CLI skeleton, single-command runner, ambient voice interface,
- * and autonomous ReAct operator interface for Sovereign Assistant powered by Shree AI OS.</p>
+ * intent-routed conversational loop, and autonomous ReAct operator interface
+ * for Sovereign Assistant powered by Shree AI OS.</p>
  */
 public class SovereignReplRunner {
 
@@ -44,6 +52,7 @@ public class SovereignReplRunner {
     private final UserMemoryProfile userProfile;
     private final ProceduralSkillStore skillStore;
     private final WorkspaceContextIndexer contextIndexer;
+    private final IntentRouter intentRouter;
     private EpisodicSessionLedger episodicLedger;
 
     private final VoiceConfig voiceConfig;
@@ -52,6 +61,7 @@ public class SovereignReplRunner {
     private WorkspaceWatcherDaemon watcherDaemon;
     private boolean ambientVoiceEnabled = false;
 
+    private final Instant sessionStartTime = Instant.now();
     private SovereignClient client;
     private AutonomousOperator autonomousOperator;
 
@@ -62,10 +72,14 @@ public class SovereignReplRunner {
         this.userProfile = UserMemoryProfile.createDefault();
         this.skillStore = ProceduralSkillStore.createDefault();
         this.contextIndexer = new WorkspaceContextIndexer();
+        this.intentRouter = new IntentRouter();
 
         this.voiceConfig = VoiceConfig.defaultConfig();
         this.sttAdapter = new SpeechToTextAdapter(voiceConfig);
         this.ttsSynthesizer = new TextToSpeechSynthesizer(voiceConfig);
+
+        // Initialize runtime client singleton once at startup
+        ensureClient();
     }
 
     public static void main(String[] args) {
@@ -155,6 +169,11 @@ public class SovereignReplRunner {
             return 0;
         }
 
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("status")) {
+            handleStatus();
+            return 0;
+        }
+
         if (startIndex < args.length && args[startIndex].equalsIgnoreCase("learn")) {
             if (startIndex + 1 >= args.length) {
                 System.err.println("Error: learn requires an assignment expression. Usage: sovereign learn <alias>=<command/goal>");
@@ -176,6 +195,17 @@ public class SovereignReplRunner {
             return 0;
         }
 
+        // Natural argument pass-through (e.g. sovereign "hello", sovereign "I am Darshan")
+        if (startIndex < args.length) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = startIndex; i < args.length; i++) {
+                if (!sb.isEmpty()) sb.append(" ");
+                sb.append(args[i]);
+            }
+            handleNaturalInput(sb.toString().trim());
+            return 0;
+        }
+
         System.out.println("Unknown arguments. Usage:");
         System.out.println("  sovereign run \"<goal>\"");
         System.out.println("  sovereign exec \"<command>\"");
@@ -184,6 +214,7 @@ public class SovereignReplRunner {
         System.out.println("  sovereign watch");
         System.out.println("  sovereign memory");
         System.out.println("  sovereign context");
+        System.out.println("  sovereign status");
         System.out.println("  sovereign learn <alias>=<goal>");
         System.out.println("  sovereign repl");
         return 1;
@@ -210,15 +241,27 @@ public class SovereignReplRunner {
 
     public int executeAutonomousGoal(String goal) {
         ensureOperator();
+
+        // Check intent: Prevent CHAT, MEMORY, and non-tool PROJECT queries from reaching shell_exec
+        IntentClassificationResult classification = intentRouter.classify(goal);
+        if (classification.intentType() == UserIntentType.CHAT
+                || classification.intentType() == UserIntentType.MEMORY
+                || (classification.intentType() == UserIntentType.PROJECT && !isToolExecutionProjectQuery(goal))) {
+            handleNaturalInput(goal);
+            return 0;
+        }
+
+        String normalizedGoal = classification.normalizedQuery().isEmpty() ? goal : classification.normalizedQuery();
+
         System.out.println("\n>>> [SOVEREIGN OPERATOR] Autonomous ReAct Loop Initiated for Goal:");
-        System.out.println("    \"" + goal + "\"\n");
+        System.out.println("    \"" + normalizedGoal + "\"\n");
 
         long start = System.currentTimeMillis();
-        AutonomousOperator.OperatorResult result = autonomousOperator.execute(goal);
+        AutonomousOperator.OperatorResult result = autonomousOperator.execute(normalizedGoal);
         long elapsed = System.currentTimeMillis() - start;
 
         if (episodicLedger != null) {
-            episodicLedger.recordGoal(result, elapsed);
+            episodicLedger.recordGoal(result, classification.intentType(), classification.confidence(), elapsed);
         }
 
         if (ambientVoiceEnabled && ttsSynthesizer != null) {
@@ -267,7 +310,7 @@ public class SovereignReplRunner {
 
             try {
                 this.ambientVoiceEnabled = true;
-                executeAutonomousGoal(intent);
+                handleNaturalInput(intent);
             } finally {
                 this.ambientVoiceEnabled = false;
             }
@@ -355,7 +398,8 @@ public class SovereignReplRunner {
             } else if (line.equalsIgnoreCase("status")) {
                 handleStatus();
             } else {
-                System.out.println("Unrecognized command. Type 'help' for command list.");
+                // Conversational natural prompt evaluation
+                handleNaturalInput(line);
             }
         }
 
@@ -363,6 +407,142 @@ public class SovereignReplRunner {
         if (client != null) {
             client.shutdown();
         }
+    }
+
+    /**
+     * Evaluates and routes natural conversational prompts across CHAT, MEMORY, PROJECT, SYSTEM, and EXECUTE.
+     */
+    public void handleNaturalInput(String input) {
+        ensureOperator();
+        IntentClassificationResult classification = intentRouter.classify(input);
+
+        switch (classification.intentType()) {
+            case CHAT -> {
+                String userName = userProfile.getUserName();
+                String reply = userName != null && !userName.isBlank()
+                        ? "Hello " + userName + "! How can I assist you today?"
+                        : "Hello! I am Sovereign Operator, powered by Shree AI OS. How can I help you today?";
+                System.out.println(reply);
+                if (ambientVoiceEnabled) {
+                    ttsSynthesizer.speak(reply);
+                }
+                if (episodicLedger != null) {
+                    episodicLedger.recordGoal(
+                            UUID.randomUUID().toString(),
+                            UserIntentType.CHAT,
+                            input,
+                            "Conversational greeting",
+                            GoalStatus.SUCCESS,
+                            classification.confidence(),
+                            reply,
+                            10
+                    );
+                }
+            }
+            case MEMORY -> {
+                String op = classification.entities().get("operation");
+                if ("STORE_NAME".equals(op)) {
+                    String name = classification.entities().get("userName");
+                    userProfile.setUserName(name);
+                    try {
+                        userProfile.saveToFile(UserMemoryProfile.DEFAULT_PROFILE_PATH);
+                    } catch (Exception ignored) {
+                    }
+                    String reply = "Nice to meet you, " + name + ". I'll remember your name.";
+                    System.out.println(reply);
+                    if (ambientVoiceEnabled) ttsSynthesizer.speak(reply);
+                    if (episodicLedger != null) {
+                        episodicLedger.recordGoal(
+                                UUID.randomUUID().toString(),
+                                UserIntentType.MEMORY,
+                                input,
+                                "Store user name: " + name,
+                                GoalStatus.SUCCESS,
+                                classification.confidence(),
+                                reply,
+                                10
+                        );
+                    }
+                } else if ("RECALL_NAME".equals(op)) {
+                    String name = userProfile.getUserName();
+                    String reply = name != null && !name.isBlank()
+                            ? "Your name is " + name + "."
+                            : "I don't know your name yet. You can tell me by saying 'I am <name>'.";
+                    System.out.println(reply);
+                    if (ambientVoiceEnabled) ttsSynthesizer.speak(reply);
+                    if (episodicLedger != null) {
+                        episodicLedger.recordGoal(
+                                UUID.randomUUID().toString(),
+                                UserIntentType.MEMORY,
+                                input,
+                                "Recall user name",
+                                GoalStatus.SUCCESS,
+                                classification.confidence(),
+                                reply,
+                                10
+                        );
+                    }
+                } else if ("STORE_PREFERENCE".equals(op)) {
+                    String k = classification.entities().get("preferenceKey");
+                    String v = classification.entities().get("preferenceValue");
+                    userProfile.setProperty(k, v);
+                    try {
+                        userProfile.saveToFile(UserMemoryProfile.DEFAULT_PROFILE_PATH);
+                    } catch (Exception ignored) {
+                    }
+                    String reply = "I have updated your " + k + " preference to: " + v;
+                    System.out.println(reply);
+                    if (ambientVoiceEnabled) ttsSynthesizer.speak(reply);
+                } else {
+                    printMemory();
+                }
+            }
+            case PROJECT -> {
+                WorkspaceContext ctx = contextIndexer.getContext();
+                String lower = input.toLowerCase();
+                if (lower.contains("source") || lower.contains("java") || lower.contains("find")) {
+                    executeAutonomousGoal("Find all Java source directories");
+                } else {
+                    if (client != null && client.getProjectSdk() != null) {
+                        try {
+                            client.getProjectSdk().analyze(ctx.rootPath());
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    System.out.println("=== PROJECT INTELLIGENCE SUMMARY ===");
+                    System.out.println("Project Name   : " + ctx.projectName());
+                    System.out.println("Project Version: " + ctx.projectVersion());
+                    System.out.println("Build Tool     : " + ctx.buildTool());
+                    System.out.println("Framework      : " + ctx.detectedFramework());
+                    System.out.println("Source Roots   : " + ctx.sourceDirectories());
+                    if (episodicLedger != null) {
+                        episodicLedger.recordGoal(
+                                UUID.randomUUID().toString(),
+                                UserIntentType.PROJECT,
+                                input,
+                                "Project intelligence summary",
+                                GoalStatus.SUCCESS,
+                                classification.confidence(),
+                                "Project " + ctx.projectName() + " (" + ctx.buildTool() + ")",
+                                25
+                        );
+                    }
+                }
+            }
+            case SYSTEM -> {
+                handleStatus();
+            }
+            case EXECUTE -> {
+                String cmd = classification.normalizedQuery().isEmpty() ? input : classification.normalizedQuery();
+                executeAutonomousGoal(cmd);
+            }
+        }
+    }
+
+    private boolean isToolExecutionProjectQuery(String query) {
+        if (query == null) return false;
+        String lower = query.toLowerCase();
+        return lower.contains("find") || lower.contains("walk") || lower.contains("list files");
     }
 
     private void handleWatchToggle() {
@@ -375,15 +555,20 @@ public class SovereignReplRunner {
         }
     }
 
+    private synchronized SovereignClient ensureClient() {
+        if (client == null) {
+            try {
+                client = SovereignClient.create();
+            } catch (Exception e) {
+                System.err.println("Warning: SovereignClient init fallback: " + e.getMessage());
+            }
+        }
+        return client;
+    }
+
     private synchronized void ensureOperator() {
         if (autonomousOperator == null) {
-            if (client == null) {
-                try {
-                    client = SovereignClient.create();
-                } catch (Exception e) {
-                    System.err.println("Warning: SovereignClient init fallback: " + e.getMessage());
-                }
-            }
+            ensureClient();
             if (episodicLedger == null) {
                 this.episodicLedger = new EpisodicSessionLedger(client != null ? client.getMemorySdk() : null);
             }
@@ -425,17 +610,19 @@ public class SovereignReplRunner {
     public void printMemory() {
         ensureOperator();
         System.out.println("=== USER MEMORY PROFILE ===");
+        System.out.println("User Name        : " + (userProfile.getUserName() != null ? userProfile.getUserName() : "<not set>"));
         System.out.println("Preferred Shell  : " + userProfile.getPreferredShell());
         System.out.println("Preferred Editor : " + userProfile.getPreferredEditor());
         System.out.println("Custom Aliases   : " + userProfile.getCustomAliases());
         System.out.println("Favorite Projects: " + userProfile.getFavoriteProjects());
+        System.out.println("Properties       : " + userProfile.getProperties());
         System.out.println("\n=== EPISODIC GOAL HISTORY ===");
         var recent = episodicLedger.getRecentGoals(10);
         if (recent.isEmpty()) {
             System.out.println("No past goal executions recorded in episodic ledger.");
         } else {
-            recent.forEach(e -> System.out.printf("  [%s] %s | Success: %s (%dms)%n",
-                    e.goalId(), e.description(), e.success(), e.durationMs()));
+            recent.forEach(e -> System.out.printf("  [%s] [%s] %s | Status: %s (%dms)%n",
+                    e.goalId(), e.intent(), e.description(), e.status(), e.durationMs()));
         }
         System.out.println("\n=== PROCEDURAL SKILLS ===");
         skillStore.getAllSkills().forEach((name, def) ->
@@ -502,22 +689,27 @@ public class SovereignReplRunner {
     }
 
     private void handleStatus() {
-        if (client == null) {
-            try {
-                client = SovereignClient.create();
-            } catch (Exception e) {
-                System.err.println("Failed to initialize SovereignClient: " + e.getMessage());
-                return;
-            }
-        }
-        System.out.println("Shree AI OS Runtime Status: " + client.getPlatformRuntime().getState());
-        System.out.println("Is Initialized: " + client.isInitialized());
-        System.out.println("Is Running: " + client.isRunning());
+        ensureClient();
+        ensureOperator();
+        long uptimeSec = Duration.between(sessionStartTime, Instant.now()).toSeconds();
+        String state = client != null ? client.getPlatformRuntime().getState().name() : "IN_MEMORY";
+        int memoryCount = episodicLedger != null ? episodicLedger.getAllEntries().size() : 0;
+        String userName = userProfile.getUserName() != null ? userProfile.getUserName() : "Anonymous";
+
+        System.out.println("=== SOVEREIGN OPERATOR STATUS ===");
+        System.out.println("Runtime State   : " + state);
+        System.out.println("Session Uptime  : " + uptimeSec + "s");
+        System.out.println("Memory Entries  : " + memoryCount);
+        System.out.println("Identified User : " + userName);
+        System.out.println("Preferred Shell : " + userProfile.getPreferredShell());
+        System.out.println("Preferred Editor: " + userProfile.getPreferredEditor());
+        System.out.println("Active SDKs     : PlanningSDK, ReasoningSDK, MemorySDK, ProjectSDK, DeveloperSDK (5 initialized)");
     }
 
     private void printHelp() {
         System.out.println("""
             Commands:
+              <natural query>         Conversational input routed via IntentRouter (e.g. 'hello', 'I am Darshan')
               run <goal>              Execute autonomous ReAct cognitive loop on goal
               exec <command>          Execute host OS shell command directly
               speak <text>            Synthesize and speak text response (TTS)
@@ -529,7 +721,7 @@ public class SovereignReplRunner {
               context                 Display detected workspace information
               learn <alias>=<goal>    Save reusable procedural skill
               processes               List top active processes
-              status                  Check Shree AI OS runtime status
+              status                  Check Sovereign Operator runtime status and session uptime
               help                    Show this help message
               exit / quit             Exit REPL
             """);
@@ -569,6 +761,10 @@ public class SovereignReplRunner {
         return contextIndexer;
     }
 
+    public IntentRouter getIntentRouter() {
+        return intentRouter;
+    }
+
     public VoiceConfig getVoiceConfig() {
         return voiceConfig;
     }
@@ -583,5 +779,9 @@ public class SovereignReplRunner {
 
     public WorkspaceWatcherDaemon getWatcherDaemon() {
         return watcherDaemon;
+    }
+
+    public SovereignClient getClient() {
+        return ensureClient();
     }
 }

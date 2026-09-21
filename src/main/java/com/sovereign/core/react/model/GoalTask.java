@@ -53,13 +53,27 @@ public class GoalTask {
         return completedAt;
     }
 
+    public synchronized GoalTask markRunning() {
+        this.status = GoalStatus.RUNNING;
+        return this;
+    }
+
     public synchronized GoalTask markInProgress() {
-        this.status = GoalStatus.IN_PROGRESS;
+        return markRunning();
+    }
+
+    public synchronized GoalTask markSuccess() {
+        this.status = GoalStatus.SUCCESS;
+        this.completedAt = Instant.now();
         return this;
     }
 
     public synchronized GoalTask markCompleted() {
-        this.status = GoalStatus.COMPLETED;
+        return markSuccess();
+    }
+
+    public synchronized GoalTask markRecovered() {
+        this.status = GoalStatus.RECOVERED;
         this.completedAt = Instant.now();
         return this;
     }
@@ -70,9 +84,17 @@ public class GoalTask {
         return this;
     }
 
+    public synchronized GoalTask markCancelled() {
+        this.status = GoalStatus.CANCELLED;
+        this.completedAt = Instant.now();
+        return this;
+    }
+
     public synchronized GoalTask withStatus(GoalStatus newStatus) {
         this.status = newStatus;
-        if (newStatus == GoalStatus.COMPLETED || newStatus == GoalStatus.FAILED) {
+        if (newStatus == GoalStatus.SUCCESS || newStatus == GoalStatus.COMPLETED
+                || newStatus == GoalStatus.FAILED || newStatus == GoalStatus.RECOVERED
+                || newStatus == GoalStatus.CANCELLED) {
             this.completedAt = Instant.now();
         }
         return this;

@@ -6,6 +6,8 @@ import com.sovereign.core.react.recovery.CausalErrorRecoveryEngine;
 import com.sovereign.core.tools.FileSystemTool;
 import com.sovereign.core.tools.ProcessControlTool;
 import com.sovereign.core.tools.ShellExecutionTool;
+import com.sovereign.core.workspace.WorkspaceContext;
+import com.sovereign.core.workspace.WorkspaceContextIndexer;
 
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -80,7 +82,7 @@ public class AutonomousOperator {
      */
     public OperatorResult execute(GoalTask goalTask) {
         Objects.requireNonNull(goalTask, "GoalTask must not be null");
-        goalTask.markInProgress();
+        goalTask.markRunning();
 
         // 1. Decompose goal into multi-step DAG ExecutionPlan
         ExecutionPlan plan = decomposer.decompose(goalTask);
@@ -184,7 +186,18 @@ public class AutonomousOperator {
         }
 
         // 4. Final Result formulation
-        goalTask.markCompleted();
+        if (completedStepIds.size() < allStepIds.size()) {
+            goalTask.markFailed();
+            String summary = "Goal execution failed: Not all plan steps completed.";
+            emit(new OperatorEvent.GoalFinished(goalTask, false, summary));
+            return new OperatorResult(goalTask, plan, false, iterations, selfCorrections, stepResults, summary);
+        }
+
+        if (selfCorrections > 0) {
+            goalTask.markRecovered();
+        } else {
+            goalTask.markSuccess();
+        }
         String summary = "Successfully completed goal with " + completedStepIds.size() + " steps in " + iterations + " iterations.";
         emit(new OperatorEvent.GoalFinished(goalTask, true, summary));
         return new OperatorResult(goalTask, plan, true, iterations, selfCorrections, stepResults, summary);
@@ -219,10 +232,62 @@ public class AutonomousOperator {
                 }
                 case "file_walk" -> {
                     String path = (String) step.parameters().getOrDefault("path", ".");
-                    int depth = ((Number) step.parameters().getOrDefault("maxDepth", 2)).intValue();
+                    int depth = ((Number) step.parameters().getOrDefault("maxDepth", 4)).intValue();
                     var list = fileSystemTool.walkDirectory(path, depth);
                     long duration = System.currentTimeMillis() - start;
-                    yield StepResult.success(step.stepId(), list.toString(), "Walked directory: found " + list.size() + " items", duration);
+
+                    String observationOutput;
+                    String description = step.description().toLowerCase();
+                    if (description.contains("source") || description.contains("java")) {
+                        Set<String> roots = new LinkedHashSet<>();
+                        for (FileSystemTool.FileInfo info : list) {
+                            String rel = info.relativePath().replace('\\', '/');
+                            if (rel.contains("src/main/java")) {
+                                int idx = rel.indexOf("src/main/java");
+                                roots.add(rel.substring(0, idx) + "src/main/java");
+                            }
+                            if (rel.contains("src/test/java")) {
+                                int idx = rel.indexOf("src/test/java");
+                                roots.add(rel.substring(0, idx) + "src/test/java");
+                            }
+                        }
+                        List<String> sourceRoots = new ArrayList<>(roots);
+                        if (sourceRoots.isEmpty()) {
+                            sourceRoots = list.stream()
+                                    .filter(FileSystemTool.FileInfo::isDirectory)
+                                    .map(p -> p.relativePath().replace('\\', '/'))
+                                    .filter(p -> p.endsWith("java") || p.endsWith("src"))
+                                    .distinct()
+                                    .toList();
+                        }
+                        observationOutput = "Identified Java source directories: " + sourceRoots;
+                    } else {
+                        List<String> paths = list.stream()
+                                .map(p -> p.relativePath().replace('\\', '/'))
+                                .toList();
+                        observationOutput = paths.size() > 20
+                                ? "Found " + paths.size() + " paths: " + paths.subList(0, 20) + "..."
+                                : "Found paths: " + paths;
+                    }
+                    yield StepResult.success(step.stepId(), observationOutput, observationOutput, duration);
+                }
+                case "project_analyze" -> {
+                    WorkspaceContext ctx = decomposer != null && decomposer.getContextIndexer() != null
+                            ? decomposer.getContextIndexer().getContext()
+                            : new WorkspaceContextIndexer().getContext();
+                    if (decomposer != null && decomposer.getContextIndexer() != null && decomposer.getContextIndexer().getProjectSdk() != null) {
+                        try {
+                            decomposer.getContextIndexer().getProjectSdk().analyze(ctx.rootPath());
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    String summary = "Workspace Analysis: Project=" + ctx.projectName()
+                            + ", Version=" + ctx.projectVersion()
+                            + ", BuildTool=" + ctx.buildTool()
+                            + ", Framework=" + ctx.detectedFramework()
+                            + ", SourceRoots=" + ctx.sourceDirectories();
+                    long duration = System.currentTimeMillis() - start;
+                    yield StepResult.success(step.stepId(), summary, summary, duration);
                 }
                 case "process_list" -> {
                     String filter = (String) step.parameters().getOrDefault("filter", null);

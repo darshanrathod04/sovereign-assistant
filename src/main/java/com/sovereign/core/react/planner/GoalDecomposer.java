@@ -2,6 +2,7 @@ package com.sovereign.core.react.planner;
 
 import com.shreeai.os.platform.sdk.PlanningSDK;
 import com.shreeai.os.platform.sdk.SDKResponse;
+import com.sovereign.core.intent.IntentRouter;
 import com.sovereign.core.memory.ProceduralSkillStore;
 import com.sovereign.core.memory.UserMemoryProfile;
 import com.sovereign.core.react.model.ExecutionPlan;
@@ -213,23 +214,38 @@ public class GoalDecomposer {
     private record ToolBinding(String toolName, Map<String, Object> parameters) {}
 
     private ToolBinding matchTool(String intent) {
+        String normalized = IntentRouter.stripImperativePrefix(intent.trim());
         String lower = intent.toLowerCase().trim();
+        String normalizedLower = normalized.toLowerCase().trim();
         boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
 
         // 0. Ambiguous build/test goals resolved via WorkspaceContext
         if (lower.equals("run tests") || lower.equals("test the app") || lower.equals("run test suite")
-                || lower.equals("test") || lower.equals("tests") || lower.contains("run tests")) {
+                || lower.equals("test") || lower.equals("tests") || lower.contains("run tests")
+                || normalizedLower.equals("test") || normalizedLower.equals("tests")) {
             String testCmd = contextIndexer != null ? contextIndexer.getContext().getTestCommand() : "mvn test";
             return new ToolBinding("shell_exec", Map.of("command", testCmd));
         }
 
         if (lower.equals("build project") || lower.equals("build the app") || lower.equals("compile project")
-                || lower.equals("build") || lower.equals("compile")) {
+                || lower.equals("build") || lower.equals("compile")
+                || normalizedLower.equals("build") || normalizedLower.equals("compile")) {
             String buildCmd = contextIndexer != null ? contextIndexer.getContext().getBuildCommand() : "mvn compile";
             return new ToolBinding("shell_exec", Map.of("command", buildCmd));
         }
 
-        // 1. Directory creation
+        // 0b. Workspace / Project Analysis goals resolved without shell execution
+        if ((lower.contains("analyze") || lower.contains("inspect") || lower.contains("summarize") || lower.contains("explain"))
+                && (lower.contains("workspace") || lower.contains("project") || lower.contains("repo") || lower.contains("maven") || lower.contains("codebase"))) {
+            return new ToolBinding("project_analyze", Map.of("path", "."));
+        }
+
+        // 1. Concrete recognized shell tool commands (e.g., git status, mvn clean, npm test, echo ...)
+        if (isRecognizedShellCommand(normalizedLower)) {
+            return new ToolBinding("shell_exec", Map.of("command", normalized));
+        }
+
+        // 2. Directory creation
         if (lower.contains("create") && (lower.contains("directory") || lower.contains("folder") || lower.contains("subfolder"))) {
             String dir = extractPath(intent, "target");
             String cmd = isWindows
@@ -238,46 +254,69 @@ public class GoalDecomposer {
             return new ToolBinding("shell_exec", Map.of("command", cmd, "targetDir", dir));
         }
 
-        // 2. Writing file
+        // 3. Writing file
         if (lower.contains("write") || lower.contains("create file") || lower.contains("save")) {
             String path = extractPath(intent, "output.txt");
             String content = extractQuotedContent(intent, "Sovereign default generated content");
             return new ToolBinding("file_write", Map.of("path", path, "content", content));
         }
 
-        // 3. Reading / verifying / checksumming file
-        if (lower.contains("read") || lower.contains("verify") || lower.contains("check") || lower.contains("checksum")) {
+        // 4. Reading / verifying file (only genuine file read operations)
+        if (lower.startsWith("read") || lower.contains("read file") || lower.contains("read '") || lower.contains("read \"")
+                || lower.startsWith("cat ") || lower.contains("checksum") || (lower.contains("verify") && lower.contains("file"))) {
             String path = extractPath(intent, "output.txt");
             return new ToolBinding("file_read", Map.of("path", path));
         }
 
-        // 4. Directory tree walk / search
+        // 5. Directory tree walk / search
         if (lower.contains("walk") || lower.contains("list files") || lower.contains("find")) {
             String path = extractPath(intent, ".");
-            return new ToolBinding("file_walk", Map.of("path", path, "maxDepth", 3));
+            int depth = (lower.contains("source") || lower.contains("java") || lower.contains("all")) ? 6 : 4;
+            return new ToolBinding("file_walk", Map.of("path", path, "maxDepth", depth));
         }
 
-        // 5. Process inspection
+        // 6. Process inspection
         if (lower.contains("process") || lower.contains("tasklist")) {
             String filter = extractQuotedContent(intent, "");
             return new ToolBinding("process_list", Map.of("filter", filter));
         }
 
-        // 6. Generic Shell execution
-        return new ToolBinding("shell_exec", Map.of("command", intent));
+        // 7. Generic Shell execution with normalized command
+        return new ToolBinding("shell_exec", Map.of("command", normalized.isEmpty() ? intent : normalized));
+    }
+
+    private boolean isRecognizedShellCommand(String cmd) {
+        return cmd.startsWith("git ")
+                || cmd.startsWith("mvn ")
+                || cmd.startsWith("npm ")
+                || cmd.startsWith("gradle ")
+                || cmd.startsWith("cargo ")
+                || cmd.startsWith("docker ")
+                || cmd.startsWith("echo ")
+                || cmd.startsWith("dir ")
+                || cmd.startsWith("ls ")
+                || cmd.startsWith("cat ")
+                || cmd.equals("git")
+                || cmd.equals("mvn")
+                || cmd.equals("npm")
+                || cmd.equals("dir")
+                || cmd.equals("ls");
     }
 
     private String extractPath(String text, String defaultPath) {
+        // Strip filler words first
+        String cleaned = text.replaceAll("(?i)\\b(?:this|the|please)\\b", " ");
+
         // Extract quoted paths like 'artifacts' or "data.json"
-        Matcher quoteMatcher = Pattern.compile("['\"]([^'\"]+)['\"]").matcher(text);
+        Matcher quoteMatcher = Pattern.compile("['\"]([^'\"]+)['\"]").matcher(cleaned);
         if (quoteMatcher.find()) {
-            return quoteMatcher.group(1);
+            return quoteMatcher.group(1).trim();
         }
 
         // Extract tokens like target/file.txt or words after directory/file
-        Matcher tokenMatcher = Pattern.compile("(?i)(?:directory|folder|file|path)\\s+([a-zA-Z0-9_./\\\\-]+)").matcher(text);
+        Matcher tokenMatcher = Pattern.compile("(?i)(?:directory|folder|file|path)\\s+([a-zA-Z0-9_./\\\\-]+)").matcher(cleaned);
         if (tokenMatcher.find()) {
-            return tokenMatcher.group(1);
+            return tokenMatcher.group(1).trim();
         }
 
         return defaultPath;
@@ -310,5 +349,9 @@ public class GoalDecomposer {
 
     public PlanningSDK getPlanningSdk() {
         return planningSdk;
+    }
+
+    public WorkspaceContextIndexer getContextIndexer() {
+        return contextIndexer;
     }
 }

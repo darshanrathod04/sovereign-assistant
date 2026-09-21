@@ -120,6 +120,12 @@ public class CausalErrorRecoveryEngine {
 
         // Case C: Command execution failure (e.g. invalid flag or typo)
         if ("shell_exec".equalsIgnoreCase(failedStep.toolName())) {
+            if (errLower.contains("not recognized") || errLower.contains("command not found")
+                    || errLower.contains("cannot find") || errLower.contains("is not recognized")
+                    || errLower.contains("positionalparameter") || errLower.contains("no such file")) {
+                return RecoveryDecision.unrecoverable(cognitiveDiagnosis != null ? cognitiveDiagnosis : "Command not found or unrecognized: " + errorContext);
+            }
+
             String command = (String) failedStep.parameters().getOrDefault("command", "");
             String diagnosis = cognitiveDiagnosis != null
                     ? cognitiveDiagnosis

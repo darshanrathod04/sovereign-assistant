@@ -1,8 +1,11 @@
 package com.sovereign.core.memory;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.shreeai.os.platform.sdk.MemorySDK;
 import com.shreeai.os.platform.sdk.SDKResponse;
+import com.sovereign.core.intent.UserIntentType;
 import com.sovereign.core.react.engine.AutonomousOperator;
 import com.sovereign.core.react.model.GoalStatus;
 import com.sovereign.core.react.model.GoalTask;
@@ -16,23 +19,44 @@ import java.util.stream.Collectors;
  * <b>EpisodicSessionLedger</b>
  *
  * <p>Chronological episodic memory ledger capturing past goal executions, durations,
- * and outcomes backed by Shree AI OS {@link MemorySDK}.</p>
+ * intents, and outcomes backed by Shree AI OS {@link MemorySDK}.</p>
  */
 public class EpisodicSessionLedger {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule());
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public record EpisodicEntry(
             String goalId,
-            String description,
-            GoalStatus status,
-            boolean success,
-            int iterations,
-            int selfCorrections,
-            String summary,
-            long durationMs,
-            Instant timestamp
-    ) {}
+            Instant timestamp,
+            UserIntentType intent,
+            String originalPrompt,
+            String planSummary,
+            GoalStatus executionStatus,
+            double confidence,
+            String observationSummary,
+            long durationMs
+    ) {
+        // Backward-compatible accessors
+        public String description() {
+            return originalPrompt;
+        }
+
+        public GoalStatus status() {
+            return executionStatus;
+        }
+
+        public boolean success() {
+            return executionStatus == GoalStatus.SUCCESS
+                    || executionStatus == GoalStatus.RECOVERED
+                    || executionStatus == GoalStatus.COMPLETED;
+        }
+
+        public String summary() {
+            return observationSummary;
+        }
+    }
 
     private final MemorySDK memorySdk;
     private final List<EpisodicEntry> history = new CopyOnWriteArrayList<>();
@@ -46,21 +70,21 @@ public class EpisodicSessionLedger {
     }
 
     /**
-     * Records a completed goal execution into episodic memory.
+     * Records a completed goal execution into episodic memory using the full schema.
      */
-    public EpisodicEntry recordGoal(GoalTask goal, boolean success, int iterations, int selfCorrections, String summary, long durationMs) {
-        Objects.requireNonNull(goal, "GoalTask must not be null");
-
+    public EpisodicEntry recordGoal(String goalId, UserIntentType intent, String originalPrompt,
+                                   String planSummary, GoalStatus status, double confidence,
+                                   String observationSummary, long durationMs) {
         EpisodicEntry entry = new EpisodicEntry(
-                goal.id(),
-                goal.description(),
-                goal.status(),
-                success,
-                iterations,
-                selfCorrections,
-                summary != null ? summary : "",
-                durationMs,
-                Instant.now()
+                goalId != null ? goalId : UUID.randomUUID().toString(),
+                Instant.now(),
+                intent != null ? intent : UserIntentType.EXECUTE,
+                originalPrompt != null ? originalPrompt : "",
+                planSummary != null ? planSummary : "",
+                status != null ? status : GoalStatus.SUCCESS,
+                confidence,
+                observationSummary != null ? observationSummary : "",
+                durationMs
         );
 
         history.add(entry);
@@ -69,9 +93,9 @@ public class EpisodicSessionLedger {
         if (memorySdk != null) {
             try {
                 String json = MAPPER.writeValueAsString(entry);
-                memorySdk.store("episodic:" + goal.id(), json);
-                memorySdk.store("goal:" + goal.id(), goal.description());
-                memorySdk.store("last_executed_goal", goal.description());
+                memorySdk.store("episodic:" + entry.goalId(), json);
+                memorySdk.store("goal:" + entry.goalId(), entry.originalPrompt());
+                memorySdk.store("last_executed_goal", entry.originalPrompt());
             } catch (Exception ignored) {
             }
         }
@@ -80,15 +104,46 @@ public class EpisodicSessionLedger {
     }
 
     /**
+     * Overload recording from legacy goal parameters for backward compatibility.
+     */
+    public EpisodicEntry recordGoal(GoalTask goal, boolean success, int iterations, int selfCorrections, String summary, long durationMs) {
+        Objects.requireNonNull(goal, "GoalTask must not be null");
+        GoalStatus status = goal.status();
+        if (status == GoalStatus.PENDING || status == GoalStatus.RUNNING || status == GoalStatus.IN_PROGRESS) {
+            status = success ? (selfCorrections > 0 ? GoalStatus.RECOVERED : GoalStatus.SUCCESS) : GoalStatus.FAILED;
+        }
+        return recordGoal(
+                goal.id(),
+                UserIntentType.EXECUTE,
+                goal.description(),
+                "Execution plan with " + iterations + " iterations",
+                status,
+                1.0,
+                summary,
+                durationMs
+        );
+    }
+
+    /**
      * Overload recording directly from an {@link AutonomousOperator.OperatorResult}.
      */
     public EpisodicEntry recordGoal(AutonomousOperator.OperatorResult result, long durationMs) {
+        return recordGoal(result, UserIntentType.EXECUTE, 1.0, durationMs);
+    }
+
+    public EpisodicEntry recordGoal(AutonomousOperator.OperatorResult result, UserIntentType intent, double confidence, long durationMs) {
         Objects.requireNonNull(result, "OperatorResult must not be null");
+        GoalTask task = result.goalTask();
+        String planSummary = result.plan() != null && result.plan().steps() != null
+                ? result.plan().steps().stream().map(s -> s.description()).collect(Collectors.joining("; "))
+                : "Plan";
         return recordGoal(
-                result.goalTask(),
-                result.success(),
-                result.iterationsExecuted(),
-                result.selfCorrectionsExecuted(),
+                task.id(),
+                intent,
+                task.description(),
+                planSummary,
+                task.status(),
+                confidence,
                 result.summary(),
                 durationMs
         );
