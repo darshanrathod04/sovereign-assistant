@@ -1,6 +1,8 @@
 package com.sovereign.cli;
 
 import com.sovereign.core.client.SovereignClient;
+import com.sovereign.core.daemon.WorkspaceAlert;
+import com.sovereign.core.daemon.WorkspaceWatcherDaemon;
 import com.sovereign.core.memory.EpisodicSessionLedger;
 import com.sovereign.core.memory.ProceduralSkillStore;
 import com.sovereign.core.memory.UserMemoryProfile;
@@ -11,16 +13,20 @@ import com.sovereign.core.react.recovery.CausalErrorRecoveryEngine;
 import com.sovereign.core.tools.FileSystemTool;
 import com.sovereign.core.tools.ProcessControlTool;
 import com.sovereign.core.tools.ShellExecutionTool;
+import com.sovereign.core.voice.SpeechToTextAdapter;
+import com.sovereign.core.voice.TextToSpeechSynthesizer;
+import com.sovereign.core.voice.VoiceConfig;
 import com.sovereign.core.workspace.WorkspaceContext;
 import com.sovereign.core.workspace.WorkspaceContextIndexer;
 
+import java.io.IOException;
 import java.util.Scanner;
 
 /**
  * <b>SovereignReplRunner</b>
  *
- * <p>Interactive CLI skeleton, single-command runner, and autonomous ReAct operator
- * interface for Sovereign Assistant powered by Shree AI OS.</p>
+ * <p>Interactive CLI skeleton, single-command runner, ambient voice interface,
+ * and autonomous ReAct operator interface for Sovereign Assistant powered by Shree AI OS.</p>
  */
 public class SovereignReplRunner {
 
@@ -40,6 +46,12 @@ public class SovereignReplRunner {
     private final WorkspaceContextIndexer contextIndexer;
     private EpisodicSessionLedger episodicLedger;
 
+    private final VoiceConfig voiceConfig;
+    private final SpeechToTextAdapter sttAdapter;
+    private final TextToSpeechSynthesizer ttsSynthesizer;
+    private WorkspaceWatcherDaemon watcherDaemon;
+    private boolean ambientVoiceEnabled = false;
+
     private SovereignClient client;
     private AutonomousOperator autonomousOperator;
 
@@ -50,6 +62,10 @@ public class SovereignReplRunner {
         this.userProfile = UserMemoryProfile.createDefault();
         this.skillStore = ProceduralSkillStore.createDefault();
         this.contextIndexer = new WorkspaceContextIndexer();
+
+        this.voiceConfig = VoiceConfig.defaultConfig();
+        this.sttAdapter = new SpeechToTextAdapter(voiceConfig);
+        this.ttsSynthesizer = new TextToSpeechSynthesizer(voiceConfig);
     }
 
     public static void main(String[] args) {
@@ -105,6 +121,30 @@ public class SovereignReplRunner {
             return executeAutonomousGoal(sb.toString().trim());
         }
 
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("speak")) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Error: speak requires text. Usage: sovereign speak \"<text>\"");
+                return 1;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = startIndex + 1; i < args.length; i++) {
+                if (!sb.isEmpty()) {
+                    sb.append(" ");
+                }
+                sb.append(args[i]);
+            }
+            return handleSpeak(sb.toString().trim());
+        }
+
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("listen")) {
+            runAmbientVoiceLoop();
+            return 0;
+        }
+
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("watch")) {
+            return runWatcherDaemon(true);
+        }
+
         if (startIndex < args.length && args[startIndex].equalsIgnoreCase("memory")) {
             printMemory();
             return 0;
@@ -139,6 +179,9 @@ public class SovereignReplRunner {
         System.out.println("Unknown arguments. Usage:");
         System.out.println("  sovereign run \"<goal>\"");
         System.out.println("  sovereign exec \"<command>\"");
+        System.out.println("  sovereign speak \"<text>\"");
+        System.out.println("  sovereign listen");
+        System.out.println("  sovereign watch");
         System.out.println("  sovereign memory");
         System.out.println("  sovereign context");
         System.out.println("  sovereign learn <alias>=<goal>");
@@ -178,7 +221,91 @@ public class SovereignReplRunner {
             episodicLedger.recordGoal(result, elapsed);
         }
 
+        if (ambientVoiceEnabled && ttsSynthesizer != null) {
+            ttsSynthesizer.speak(result.summary());
+        }
+
         return result.success() ? 0 : 1;
+    }
+
+    public int handleSpeak(String text) {
+        boolean ok = ttsSynthesizer.speak(text);
+        System.out.println("[SPOKEN] " + text);
+        return ok ? 0 : 1;
+    }
+
+    public void runAmbientVoiceLoop() {
+        System.out.println("\n>>> [SOVEREIGN AMBIENT] Voice Loop Active.");
+        System.out.println("    Listening for wake-words ('Hey Sovereign', 'Jarvis')...");
+        System.out.println("    Type prompt or speech transcript below (or 'exit' to return).\n");
+
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            System.out.print("ambient-voice> ");
+            if (!scanner.hasNextLine()) {
+                break;
+            }
+            String line = scanner.nextLine().trim();
+            if (line.equalsIgnoreCase("exit") || line.equalsIgnoreCase("quit")) {
+                System.out.println("Exiting ambient voice loop.");
+                break;
+            }
+            if (line.isEmpty()) {
+                continue;
+            }
+
+            String intent = line;
+            if (sttAdapter.hasWakeWord(line)) {
+                intent = sttAdapter.stripWakeWord(line);
+                System.out.println("[WAKE-WORD DETECTED] Processing intent: " + intent);
+            }
+
+            if (intent.isEmpty()) {
+                ttsSynthesizer.speak("I am listening. How can I assist you?");
+                continue;
+            }
+
+            try {
+                this.ambientVoiceEnabled = true;
+                executeAutonomousGoal(intent);
+            } finally {
+                this.ambientVoiceEnabled = false;
+            }
+        }
+    }
+
+    public int runWatcherDaemon(boolean blocking) {
+        ensureWatcher();
+        System.out.println(">>> [SOVEREIGN WATCHER] Background workspace watcher active on: " + watcherDaemon.getRootPath());
+        if (blocking) {
+            System.out.println("Press Enter to stop monitoring...");
+            new Scanner(System.in).nextLine();
+            stopWatcher();
+            System.out.println("Workspace monitoring stopped.");
+        }
+        return 0;
+    }
+
+    public synchronized void ensureWatcher() {
+        if (watcherDaemon == null || !watcherDaemon.isRunning()) {
+            WorkspaceContext ctx = contextIndexer.getContext();
+            watcherDaemon = new WorkspaceWatcherDaemon(ctx.rootPath());
+            watcherDaemon.addListener(alert -> {
+                String prefix = alert.isErrorOrLog() ? "[WATCHER WARNING]" : "[WATCHER EVENT]";
+                System.out.printf("%s %s%n", prefix, alert.description());
+            });
+            try {
+                watcherDaemon.start();
+            } catch (IOException e) {
+                System.err.println("Failed to start workspace watcher daemon: " + e.getMessage());
+            }
+        }
+    }
+
+    public synchronized void stopWatcher() {
+        if (watcherDaemon != null) {
+            watcherDaemon.stop();
+        }
     }
 
     public void runInteractiveLoop() {
@@ -207,6 +334,12 @@ public class SovereignReplRunner {
             } else if (line.startsWith("exec ")) {
                 String cmd = line.substring(5).trim();
                 executeCommand(cmd);
+            } else if (line.startsWith("speak ")) {
+                handleSpeak(line.substring(6).trim());
+            } else if (line.equalsIgnoreCase("listen")) {
+                runAmbientVoiceLoop();
+            } else if (line.equalsIgnoreCase("watch")) {
+                handleWatchToggle();
             } else if (line.startsWith("read ")) {
                 handleRead(line.substring(5).trim());
             } else if (line.startsWith("write ")) {
@@ -226,8 +359,19 @@ public class SovereignReplRunner {
             }
         }
 
+        stopWatcher();
         if (client != null) {
             client.shutdown();
+        }
+    }
+
+    private void handleWatchToggle() {
+        if (watcherDaemon != null && watcherDaemon.isRunning()) {
+            stopWatcher();
+            System.out.println("Workspace watcher daemon stopped.");
+        } else {
+            ensureWatcher();
+            System.out.println("Workspace watcher daemon started in background.");
         }
     }
 
@@ -376,6 +520,9 @@ public class SovereignReplRunner {
             Commands:
               run <goal>              Execute autonomous ReAct cognitive loop on goal
               exec <command>          Execute host OS shell command directly
+              speak <text>            Synthesize and speak text response (TTS)
+              listen                  Enter conversational ambient voice loop with wake-word
+              watch                   Toggle background workspace watcher daemon
               read <file>             Read file within workspace boundary
               write <file> <content>  Write file within workspace boundary
               memory                  List recent episodic goals and active user profile
@@ -420,5 +567,21 @@ public class SovereignReplRunner {
 
     public WorkspaceContextIndexer getContextIndexer() {
         return contextIndexer;
+    }
+
+    public VoiceConfig getVoiceConfig() {
+        return voiceConfig;
+    }
+
+    public SpeechToTextAdapter getSttAdapter() {
+        return sttAdapter;
+    }
+
+    public TextToSpeechSynthesizer getTtsSynthesizer() {
+        return ttsSynthesizer;
+    }
+
+    public WorkspaceWatcherDaemon getWatcherDaemon() {
+        return watcherDaemon;
     }
 }
