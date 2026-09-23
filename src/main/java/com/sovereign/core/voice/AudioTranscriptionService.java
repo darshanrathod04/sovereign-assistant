@@ -41,17 +41,42 @@ public class AudioTranscriptionService {
     /** Sentinel returned by any tier when audio is silent or unintelligible. */
     public static final String SILENCE_MARKER = "[SILENCE]";
 
+    /**
+     * Sentinel returned when Gemini replied with HTTP 429 (Too Many Requests).
+     * The caller (REPL runner) should back off before retrying.
+     */
+    public static final String RATE_LIMITED_MARKER = "[RATE_LIMITED]";
+
     private static final Logger LOG = Logger.getLogger(AudioTranscriptionService.class.getName());
 
-    /** Gemini endpoint for generateContent (REST v1beta). */
-    private static final String GEMINI_ENDPOINT_TEMPLATE =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s";
+    /**
+     * Default Gemini model for audio transcription.
+     * Priority: {@code sovereign.stt.model} JVM property →
+     *           {@code SOVEREIGN_STT_MODEL} env var → {@code "gemini-2.5-flash"}.
+     *
+     * <p>Set {@code -Dsovereign.stt.model=gemini-3.6-flash} (or any active model identifier
+     * visible in the Shree AI OS runtime) to override without recompiling.</p>
+     */
+    private static final String DEFAULT_STT_MODEL = "gemini-2.5-flash";
 
-    /** Transcription system instruction sent to Gemini. */
+    /**
+     * Gemini generateContent REST endpoint template.
+     * {@code %s} = model name, second {@code %s} = API key.
+     */
+    private static final String GEMINI_ENDPOINT_TEMPLATE =
+            "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s";
+
+    /**
+     * Multilingual STT system instruction sent to Gemini.
+     * Handles English, Hindi, Hinglish, and Indian-English accents accurately.
+     */
     private static final String STT_INSTRUCTION =
-            "Listen to this audio clip. Transcribe exactly what the user said in natural text. " +
-            "Return ONLY the transcribed text, nothing else. " +
-            "If the audio is silent or unintelligible, return '[SILENCE]'.";
+            "You are an expert speech-to-text transcriber. " +
+            "Transcribe the following audio accurately. " +
+            "The speaker may speak in English, Hindi, or Hinglish (Indian English accent with Hindi words mixed in). " +
+            "Handle regional Indian accents gracefully. " +
+            "Output ONLY the verbatim transcription — no punctuation commentary, no labels, no explanation. " +
+            "If the audio is pure background noise or silence, return '[SILENCE]'.";
 
     private final ProviderConfig config;
 
@@ -68,10 +93,33 @@ public class AudioTranscriptionService {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
+     * Resolves the Gemini STT model name at runtime:
+     * <ol>
+     *   <li>{@code sovereign.stt.model} JVM system property</li>
+     *   <li>{@code SOVEREIGN_STT_MODEL} environment variable</li>
+     *   <li>{@code shree.llm.gemini.model} JVM system property (Shree AI OS runtime)</li>
+     *   <li>{@link #DEFAULT_STT_MODEL} ({@value #DEFAULT_STT_MODEL})</li>
+     * </ol>
+     */
+    static String resolveModel() {
+        String prop = System.getProperty("sovereign.stt.model");
+        if (prop != null && !prop.isBlank()) return prop.trim();
+
+        String env = System.getenv("SOVEREIGN_STT_MODEL");
+        if (env != null && !env.isBlank()) return env.trim();
+
+        String shreeModel = System.getProperty("shree.llm.gemini.model");
+        if (shreeModel != null && !shreeModel.isBlank()) return shreeModel.trim();
+
+        return DEFAULT_STT_MODEL;
+    }
+
+    /**
      * Transcribes WAV audio bytes using the best available tier.
      *
      * @param wavBytes raw WAV bytes (must include RIFF header)
      * @return transcribed text, {@value #SILENCE_MARKER} for silence/unintelligible audio,
+     *         {@value #RATE_LIMITED_MARKER} if Gemini returned HTTP 429,
      *         or {@code null} if all tiers fail (signals fallback to heuristic)
      */
     public String transcribeWav(byte[] wavBytes) {
@@ -82,13 +130,21 @@ public class AudioTranscriptionService {
         // Tier 1 — Gemini Multimodal STT (online, highest quality)
         if (config.hasGeminiKey()) {
             String result = transcribeWithGemini(wavBytes, config.getGeminiApiKey());
+            if (RATE_LIMITED_MARKER.equals(result)) {
+                return RATE_LIMITED_MARKER; // propagate to caller for backoff
+            }
             if (result != null) {
                 return sanitize(result);
             }
-            LOG.warning("[STT] Gemini transcription failed — falling through to Whisper/SAPI.");
+            // Gemini key is present but all attempts failed.
+            // Deliberately do NOT fall through to SAPI: Windows SAPI dictation produces
+            // phonetic nonsense on non-US/Indian accents ("Ernest ward has a lot").
+            // Return [SILENCE] so the ambient loop skips this turn cleanly.
+            LOG.warning("[STT] Gemini transcription failed with key present — returning [SILENCE] to protect downstream.");
+            return SILENCE_MARKER;
         }
 
-        // Tier 2 — Local Whisper CLI
+        // Tier 2 — Local Whisper CLI (only when Gemini key is absent)
         if (isWhisperAvailable()) {
             String result = transcribeWithWhisper(wavBytes);
             if (result != null && !result.isBlank()) {
@@ -97,6 +153,8 @@ public class AudioTranscriptionService {
         }
 
         // Tier 3 — Windows SAPI offline (PowerShell System.Speech)
+        // ONLY reached when no Gemini key is present (no cloud STT configured at all).
+        // When Gemini is configured, SAPI is bypassed unconditionally — see above.
         if (isWindows()) {
             String result = transcribeWithWindowsSapi(wavBytes);
             if (result != null && !result.isBlank()) {
@@ -111,17 +169,30 @@ public class AudioTranscriptionService {
     // Tier 1: Gemini Multimodal STT
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Calls Gemini generateContent using the model resolved by {@link #resolveModel()}.
+     * <ul>
+     *   <li>HTTP 200  → parse and return transcript</li>
+     *   <li>HTTP 404  → model not found; logs actionable hint to set {@code sovereign.stt.model}</li>
+     *   <li>HTTP 429  → rate limited; returns {@link #RATE_LIMITED_MARKER} immediately</li>
+     *   <li>Other 4xx/5xx → logs error body and returns {@code null}</li>
+     * </ul>
+     */
     private String transcribeWithGemini(byte[] wavBytes, String apiKey) {
+        // Resolve the active model at call-time so JVM property overrides take effect dynamically
+        String model = resolveModel();
+        LOG.info("[STT] Using Gemini model: " + model + " (override via -Dsovereign.stt.model=<name>)");
+
+        // Base64-encode — standard RFC 4648, no line breaks
+        String base64Audio = Base64.getEncoder().encodeToString(wavBytes);
+        String requestBody = buildGeminiRequest(base64Audio);
+
         try {
-            String base64Audio = Base64.getEncoder().encodeToString(wavBytes);
-
-            // Build JSON request body — inline_data with audio/wav MIME type
-            String requestBody = buildGeminiRequest(base64Audio);
-
-            URL url = URI.create(String.format(GEMINI_ENDPOINT_TEMPLATE, apiKey)).toURL();
+            String urlStr = String.format(GEMINI_ENDPOINT_TEMPLATE, model, apiKey);
+            URL url = URI.create(urlStr).toURL();
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
             conn.setDoOutput(true);
             conn.setConnectTimeout(10_000);
             conn.setReadTimeout(30_000);
@@ -131,26 +202,44 @@ public class AudioTranscriptionService {
             }
 
             int status = conn.getResponseCode();
+
             if (status == 200) {
-                String responseBody = new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-                return extractGeminiText(responseBody);
+                String responseBody = new String(
+                        conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                String text = extractGeminiText(responseBody);
+                if (text != null) {
+                    LOG.info("[STT] Gemini (" + model + ") transcribed successfully.");
+                    return text;
+                }
+                LOG.warning("[STT] Gemini (" + model + ") returned 200 but no text found in response.");
+                return null;
+
+            } else if (status == 404) {
+                LOG.warning("[STT] Gemini model '" + model + "' not found (HTTP 404). "
+                        + "Set -Dsovereign.stt.model=<valid-model> or SOVEREIGN_STT_MODEL env var "
+                        + "to override (e.g. gemini-2.5-flash, gemini-2.0-flash).");
+                return null;
+
+            } else if (status == 429) {
+                LOG.warning("[STT] Gemini rate limited (HTTP 429). Caller will back off.");
+                return RATE_LIMITED_MARKER;
+
             } else {
-                String errorBody = "";
-                try {
-                    errorBody = new String(conn.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
-                } catch (Exception ignored) {}
-                LOG.warning("[STT] Gemini HTTP " + status + ": " + errorBody.substring(0, Math.min(200, errorBody.length())));
+                String errorBody = readErrorBody(conn);
+                LOG.warning("[STT] Gemini (" + model + ") HTTP " + status + ": "
+                        + errorBody.substring(0, Math.min(300, errorBody.length())));
                 return null;
             }
+
         } catch (Exception e) {
-            LOG.log(Level.WARNING, "[STT] Gemini transcription error: " + e.getMessage());
+            LOG.log(Level.WARNING, "[STT] Gemini (" + model + ") error: " + e.getMessage());
             return null;
         }
     }
 
     /**
      * Builds the Gemini generateContent JSON body with inline audio data.
-     * Uses system instruction + inline_data (Base64 WAV).
+     * Uses system_instruction + inline_data (Base64 WAV, audio/wav MIME type).
      */
     private static String buildGeminiRequest(String base64Audio) {
         return "{\n" +
@@ -341,5 +430,16 @@ public class AudioTranscriptionService {
                        .replace("\n", "\\n")
                        .replace("\r", "\\r")
                        .replace("\t", "\\t") + "\"";
+    }
+
+    /** Safely reads the error body from an HttpURLConnection without throwing. */
+    private static String readErrorBody(HttpURLConnection conn) {
+        try {
+            java.io.InputStream errStream = conn.getErrorStream();
+            if (errStream == null) return "";
+            return new String(errStream.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 }

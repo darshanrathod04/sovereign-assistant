@@ -320,8 +320,17 @@ public class SovereignReplRunner {
     /**
      * Live ambient loop using physical microphone capture + VAD.
      * Records → transcribes → filters silence → routes → speaks in a continuous loop.
+     *
+     * <p>Includes:</p>
+     * <ul>
+     *   <li>1.5-second cooldown between turns to avoid API rate limits.</li>
+     *   <li>3-second backoff when Gemini returns HTTP 429 (rate limited).</li>
+     * </ul>
      */
     private void runMicVoiceLoop(MicrophoneAudioCapture mic) {
+        final long INTER_TURN_COOLDOWN_MS = 1_500L;
+        final long RATE_LIMIT_BACKOFF_MS  = 10_000L;
+
         while (true) {
             System.out.print("\n[SOVEREIGN AMBIENT] Listening... (speak now, or Ctrl+C to stop)\n");
             try {
@@ -329,15 +338,25 @@ public class SovereignReplRunner {
                 byte[] wavBytes = wavStream.readAllBytes();
                 if (wavBytes.length == 0) {
                     System.out.println("[MIC] No audio detected — still listening.");
+                    sleep(INTER_TURN_COOLDOWN_MS);
                     continue;
                 }
 
                 String transcript = sttAdapter.transcribe(wavBytes);
 
+                // Handle rate limiting — back off before next capture
+                if (com.sovereign.core.voice.AudioTranscriptionService.RATE_LIMITED_MARKER.equals(transcript)) {
+                    System.out.println("[MIC] Gemini rate limit (HTTP 429) — backing off for "
+                            + (RATE_LIMIT_BACKOFF_MS / 1000) + "s...");
+                    sleep(RATE_LIMIT_BACKOFF_MS);
+                    continue;
+                }
+
                 // Filter silence / unintelligible audio — do NOT call LLM
                 if (transcript == null || transcript.isBlank()
                         || com.sovereign.core.voice.AudioTranscriptionService.SILENCE_MARKER.equals(transcript)) {
                     System.out.println("[MIC SILENCE] No speech detected — still listening.");
+                    sleep(INTER_TURN_COOLDOWN_MS);
                     continue;
                 }
 
@@ -360,6 +379,7 @@ public class SovereignReplRunner {
 
                 if (intent == null || intent.isBlank()) {
                     ttsSynthesizer.speak("I am listening. How can I assist you?");
+                    sleep(INTER_TURN_COOLDOWN_MS);
                     continue;
                 }
 
@@ -371,9 +391,22 @@ public class SovereignReplRunner {
                     this.ambientVoiceEnabled = false;
                 }
 
+                // Cooldown between turns to prevent consecutive API hammering
+                sleep(INTER_TURN_COOLDOWN_MS);
+
             } catch (java.io.IOException e) {
                 System.out.println("[MIC] Audio capture error: " + e.getMessage() + " — retrying.");
+                sleep(INTER_TURN_COOLDOWN_MS);
             }
+        }
+    }
+
+    /** Non-throwing Thread.sleep wrapper. */
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
         }
     }
 
