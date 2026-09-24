@@ -25,14 +25,26 @@ import java.util.stream.Stream;
  */
 public class ReasoningSDK {
 
+    /**
+     * JARVIS persona base prompt — static portion.
+     * Dynamic portions (user name, date/time, context) are injected at call time
+     * by {@link #buildSystemPrompt(String)}.
+     */
     public static final String JARVIS_SYSTEM_PROMPT =
-            "You are Sovereign, an advanced, highly intelligent personal AI operator and system co-pilot (JARVIS persona). "
-                    + "You assist the user (Darshan) with operating system management, code intelligence, and conversational reasoning. "
-                    + "Be concise, sharp, witty, and deeply helpful.";
+            "You are Sovereign, an advanced, highly intelligent personal AI operator and system " +
+            "co-pilot inspired by JARVIS from Iron Man. " +
+            "You assist the user with operating system management, code intelligence, " +
+            "conversational reasoning, and any general knowledge question. " +
+            "Be concise, sharp, witty, deeply helpful, and direct. " +
+            "Never say you cannot access the internet — answer from your training knowledge. " +
+            "Never refuse a reasonable question. Always give a complete, intelligent answer.";
 
     private final DefaultReasoningEngine engine;
     private final ShreeAI shreeAI;
     private final DefaultRuntimeService runtimeService;
+
+    /** Optional Ollama local LLM (zero-cost offline fallback). */
+    private final com.sovereign.core.client.OllamaProvider ollamaProvider;
 
     public ReasoningSDK() {
         this(new DefaultReasoningEngine(), null, null);
@@ -50,35 +62,93 @@ public class ReasoningSDK {
         this.engine = Objects.requireNonNull(engine, "DefaultReasoningEngine must not be null");
         this.shreeAI = shreeAI;
         this.runtimeService = runtimeService;
+        // Probe Ollama at construction time — non-blocking, fails silently
+        if (com.sovereign.core.client.OllamaProvider.isAvailable()) {
+            this.ollamaProvider = new com.sovereign.core.client.OllamaProvider();
+            LOG.info("[SOVEREIGN] Ollama local LLM detected: " + ollamaProvider.getModel()
+                    + " — offline fallback enabled (zero cost).");
+        } else {
+            this.ollamaProvider = null;
+        }
+    }
+
+    private static final java.util.logging.Logger LOG =
+            java.util.logging.Logger.getLogger(ReasoningSDK.class.getName());
+
+    /**
+     * Builds the enriched, dynamic JARVIS system prompt by injecting:
+     * <ul>
+     *   <li>User's name (from the profile, if known)</li>
+     *   <li>Current date and time</li>
+     *   <li>Sovereign personality base prompt</li>
+     * </ul>
+     */
+    public static String buildSystemPrompt(String userName) {
+        String name = (userName != null && !userName.isBlank()) ? userName.trim() : "there";
+        String dateTime = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("EEEE, dd MMM yyyy HH:mm"));
+        return JARVIS_SYSTEM_PROMPT
+                + " The user's name is " + name + "."
+                + " Current date and time: " + dateTime + ".";
     }
 
     /**
-     * Executes dynamic conversational analysis or response synthesis over a given prompt,
-     * applying the Sovereign JARVIS executive persona.
+     * Executes dynamic conversational analysis over a given prompt,
+     * applying the Sovereign JARVIS executive persona with no prior context.
      */
     public String analyze(String prompt) {
-        return analyze(prompt, null);
+        return analyze(prompt, (String) null);
     }
 
     /**
-     * Executes dynamic conversational analysis with contextual grounding (user profile, workspace,
-     * conversation history), routing through the active Shree AI OS platform runtime LLM provider.
+     * Executes dynamic conversational analysis with plain-text context grounding.
      */
     public String analyze(String prompt, String context) {
+        return analyze(prompt, context, null, null);
+    }
+
+    /**
+     * <b>Multi-turn overload</b> — the primary entry point for conversational chat.
+     *
+     * <p>Injects the full conversation history ({@code turns}) into the LLM call
+     * so the model can reference prior messages, maintain coherence, and answer
+     * follow-up questions correctly.</p>
+     *
+     * @param prompt  current user message
+     * @param context plain-text grounding context (workspace facts, user profile)
+     * @param turns   full conversation history (may be null or empty for first turn)
+     * @param userName user's name for system prompt personalisation
+     */
+    public String analyze(String prompt, String context,
+                          List<com.sovereign.core.memory.ConversationTurn> turns,
+                          String userName) {
         if (prompt == null || prompt.isBlank()) {
-            return "At your service. How may I assist you, Darshan?";
+            return "At your service. How may I assist you?";
         }
 
+        String systemPrompt = buildSystemPrompt(userName);
+
+        // Build a combined full prompt for providers that don't support structured history
         StringBuilder fullPrompt = new StringBuilder();
-        fullPrompt.append("[SYSTEM]\n").append(JARVIS_SYSTEM_PROMPT).append("\n\n");
+        fullPrompt.append("[SYSTEM]\n").append(systemPrompt).append("\n\n");
         if (context != null && !context.isBlank()) {
             fullPrompt.append("[CONTEXT]\n").append(context.trim()).append("\n\n");
+        }
+        if (turns != null && !turns.isEmpty()) {
+            fullPrompt.append("[CONVERSATION HISTORY]\n");
+            // Include up to last 10 turns inline for providers that don't support roles
+            List<com.sovereign.core.memory.ConversationTurn> recent =
+                    turns.size() > 10 ? turns.subList(turns.size() - 10, turns.size()) : turns;
+            for (com.sovereign.core.memory.ConversationTurn t : recent) {
+                fullPrompt.append(t.role()).append(": ").append(t.content()).append("\n");
+            }
+            fullPrompt.append("\n");
         }
         fullPrompt.append("[USER]\n").append(prompt.trim());
 
         String promptStr = fullPrompt.toString();
 
-        // 1. Try streaming via platform runtime service LLM router
+        // Tier 1 — Platform runtime service (Gemini / OpenAI via Shree AI OS)
         if (runtimeService != null) {
             try {
                 if (runtimeService.getRuntimeState() == RuntimeState.STARTED
@@ -93,22 +163,33 @@ public class ReasoningSDK {
                         return ReasoningOutputSanitizer.sanitize(streamed, prompt, context);
                     }
                 }
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
         }
 
-        // 2. Try chat via ShreeAI client facade
+        // Tier 2 — ShreeAI chat facade
         if (shreeAI != null) {
             try {
-                SDKResponse response = ReasoningOutputSanitizer.executeSilently(() -> shreeAI.chat(promptStr));
+                SDKResponse response = ReasoningOutputSanitizer.executeSilently(
+                        () -> shreeAI.chat(promptStr));
                 if (response != null && response.answer() != null && !response.answer().isBlank()) {
                     return ReasoningOutputSanitizer.sanitize(response.answer().trim(), prompt, context);
                 }
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
         }
 
-        // 3. Deterministic fallback to DefaultReasoningEngine
+        // Tier 3 — Ollama local LLM (zero-cost offline fallback)
+        if (ollamaProvider != null) {
+            try {
+                String ollamaReply = ollamaProvider.chat(systemPrompt, prompt,
+                        turns != null ? turns : Collections.emptyList());
+                if (ollamaReply != null && !ollamaReply.isBlank()) {
+                    LOG.info("[SOVEREIGN] Ollama answered: " + ollamaReply.length() + " chars.");
+                    return ReasoningOutputSanitizer.sanitize(ollamaReply, prompt, context);
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Tier 4 — Deterministic DefaultReasoningEngine
         try {
             ReasoningResult result = engine.reason(prompt, Collections.emptyList(), Collections.emptyList());
             if (result != null && result.conclusion() != null && !result.conclusion().isBlank()) {
@@ -116,8 +197,7 @@ public class ReasoningSDK {
             } else if (result != null && result.summary() != null && !result.summary().isBlank()) {
                 return ReasoningOutputSanitizer.sanitize(result.summary(), prompt, context);
             }
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
 
         return "Understood. I am tracking your request and standing by to execute.";
     }

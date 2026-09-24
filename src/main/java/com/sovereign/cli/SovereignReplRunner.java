@@ -7,8 +7,11 @@ import com.sovereign.core.daemon.WorkspaceWatcherDaemon;
 import com.sovereign.core.intent.IntentClassificationResult;
 import com.sovereign.core.intent.IntentRouter;
 import com.sovereign.core.intent.UserIntentType;
+import com.sovereign.core.memory.ConversationContextWindow;
+import com.sovereign.core.memory.ConversationTurn;
 import com.sovereign.core.memory.EpisodicSessionLedger;
 import com.sovereign.core.memory.ProceduralSkillStore;
+import com.sovereign.core.memory.SessionStore;
 import com.sovereign.core.memory.UserMemoryProfile;
 import com.sovereign.core.react.engine.AutonomousOperator;
 import com.sovereign.core.react.model.GoalStatus;
@@ -75,6 +78,12 @@ public class SovereignReplRunner {
     private AutonomousOperator autonomousOperator;
     private final List<ChatTurn> conversationHistory = new ArrayList<>();
 
+    /** Multi-turn conversation context window — injected into every LLM call. */
+    private final ConversationContextWindow contextWindow;
+
+    /** Persists conversation turns to ~/.sovereign/sessions/ across restarts. */
+    private final SessionStore sessionStore;
+
     public SovereignReplRunner() {
         this(ProviderConfig.load());
     }
@@ -92,6 +101,23 @@ public class SovereignReplRunner {
         this.voiceConfig = VoiceConfig.defaultConfig();
         this.sttAdapter = new SpeechToTextAdapter(voiceConfig);
         this.ttsSynthesizer = new TextToSpeechSynthesizer(voiceConfig);
+
+        // ── Multi-turn context window + session persistence ────────────────
+        this.contextWindow = new ConversationContextWindow();
+        this.sessionStore  = SessionStore.loadOrCreate();
+
+        // Replay last session's turns into the context window so Sovereign
+        // remembers the previous conversation on restart
+        List<ConversationTurn> prior = sessionStore.loadTurns();
+        if (!prior.isEmpty()) {
+            // Load only the last maxTurns worth to keep context focused
+            int load = Math.min(prior.size(), ConversationContextWindow.DEFAULT_MAX_TURNS);
+            prior.subList(prior.size() - load, prior.size()).forEach(t -> {
+                if ("user".equals(t.role()))      contextWindow.addUser(t.content());
+                else if ("assistant".equals(t.role())) contextWindow.addAssistant(t.content());
+            });
+            System.out.println("[SOVEREIGN] Session resumed — " + load + " prior turns loaded.");
+        }
 
         // Initialize runtime client singleton once at startup
         ensureClient();
@@ -562,9 +588,19 @@ public class SovereignReplRunner {
                 ensureClient();
                 String grounding = buildChatGroundingContext();
                 String reply = null;
+
+                // Record user turn in context window BEFORE calling LLM
+                contextWindow.addUser(normalized);
+                sessionStore.append(ConversationTurn.user(normalized));
+
                 if (client != null && client.reasoning() != null) {
                     try {
-                        reply = client.reasoning().analyze(normalized, grounding);
+                        // Pass full conversation history for true multi-turn coherence
+                        reply = client.reasoning().analyze(
+                                normalized,
+                                grounding,
+                                contextWindow.getTurns(),
+                                userProfile.getUserName());
                     } catch (Exception ignored) {
                     }
                 }
@@ -574,6 +610,12 @@ public class SovereignReplRunner {
                             ? "Hello " + userName + "! Sovereign online and ready to assist."
                             : "Hello! I am Sovereign Operator, powered by Shree AI OS. How can I help you today?";
                 }
+
+                // Record assistant reply in context window + session store
+                contextWindow.addAssistant(reply);
+                sessionStore.append(ConversationTurn.assistant(reply));
+                sessionStore.save(); // persist after every exchange
+
                 System.out.println(reply);
                 if (ambientVoiceEnabled && ttsSynthesizer != null) {
                     ttsSynthesizer.speak(reply);
