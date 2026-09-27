@@ -20,6 +20,7 @@ import com.sovereign.core.react.model.GoalStatus;
 import com.sovereign.core.react.model.OperatorEvent;
 import com.sovereign.core.react.planner.GoalDecomposer;
 import com.sovereign.core.react.recovery.CausalErrorRecoveryEngine;
+import com.sovereign.core.tools.CodeGenerationTool;
 import com.sovereign.core.tools.FileSystemTool;
 import com.sovereign.core.tools.GitHubTool;
 import com.sovereign.core.tools.LogAnalyzerTool;
@@ -27,6 +28,7 @@ import com.sovereign.core.tools.MultimodalIngestTool;
 import com.sovereign.core.tools.ProcessControlTool;
 import com.sovereign.core.tools.ScreenCaptureTool;
 import com.sovereign.core.tools.ShellExecutionTool;
+import com.sovereign.core.tools.TestGenerationTool;
 import com.sovereign.core.tools.WebPageReaderTool;
 import com.sovereign.core.tools.WebSearchTool;
 import com.sovereign.core.voice.MicrophoneAudioCapture;
@@ -73,6 +75,8 @@ public class SovereignReplRunner {
     private final WebSearchTool webSearchTool;
     private final WebPageReaderTool webReaderTool;
     private final GitHubTool gitHubTool;
+    private final CodeGenerationTool codeGenTool;
+    private final TestGenerationTool testGenTool;
 
     private final UserMemoryProfile userProfile;
     private final ProceduralSkillStore skillStore;
@@ -118,6 +122,8 @@ public class SovereignReplRunner {
         this.webSearchTool = new WebSearchTool();
         this.webReaderTool = new WebPageReaderTool();
         this.gitHubTool = new GitHubTool();
+        this.codeGenTool = new CodeGenerationTool();
+        this.testGenTool = new TestGenerationTool();
         this.userProfile = UserMemoryProfile.createDefault();
         this.skillStore = ProceduralSkillStore.createDefault();
         this.contextIndexer = new WorkspaceContextIndexer();
@@ -256,6 +262,36 @@ public class SovereignReplRunner {
         if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("voice-status") || args[startIndex].equalsIgnoreCase("stt-status"))) {
             printVoiceStatus();
             return 0;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("quota") || args[startIndex].equalsIgnoreCase("rate-limit"))) {
+            printRateLimits();
+            return 0;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("generate") || args[startIndex].equalsIgnoreCase("codegen"))) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Usage: sovereign generate <specification>");
+                return 1;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = startIndex + 1; i < args.length; i++) {
+                if (!sb.isEmpty()) sb.append(" ");
+                sb.append(args[i]);
+            }
+            var res = codeGenTool.generate(sb.toString().trim(), null);
+            System.out.println(res.formatSummary());
+            return res.success() ? 0 : 1;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("test-gen") || args[startIndex].equalsIgnoreCase("generate-test"))) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Usage: sovereign test-gen <path-to-source-class>");
+                return 1;
+            }
+            var res = testGenTool.generateTests(java.nio.file.Path.of(args[startIndex + 1].trim()), null);
+            System.out.println(res.formatSummary());
+            return res.success() ? 0 : 1;
         }
 
         if (startIndex < args.length && args[startIndex].equalsIgnoreCase("keys")) {
@@ -745,6 +781,16 @@ public class SovereignReplRunner {
                 }
             } else if (line.equalsIgnoreCase("voice-status") || line.equalsIgnoreCase("stt-status")) {
                 printVoiceStatus();
+            } else if (line.equalsIgnoreCase("quota") || line.equalsIgnoreCase("rate-limit")) {
+                printRateLimits();
+            } else if (line.startsWith("generate ") || line.startsWith("codegen ")) {
+                String spec = line.startsWith("generate ") ? line.substring(9).trim() : line.substring(8).trim();
+                var res = codeGenTool.generate(spec, null);
+                System.out.println(res.formatSummary());
+            } else if (line.startsWith("test-gen ") || line.startsWith("generate-test ")) {
+                String p = line.startsWith("test-gen ") ? line.substring(9).trim() : line.substring(14).trim();
+                var res = testGenTool.generateTests(java.nio.file.Path.of(p), null);
+                System.out.println(res.formatSummary());
             } else if (line.equalsIgnoreCase("keys") || line.equalsIgnoreCase("sovereign keys")) {
                 printKeys();
             } else {
@@ -1242,6 +1288,18 @@ public class SovereignReplRunner {
         System.out.println("==================================================");
     }
 
+    public void printRateLimits() {
+        com.sovereign.core.config.RateLimitGuard guard = com.sovereign.core.config.RateLimitGuard.getInstance();
+        System.out.println("==================================================");
+        System.out.println("  SOVEREIGN ZERO-COST RATE LIMIT GUARD (PHASE 6)");
+        System.out.println("==================================================");
+        System.out.println("  Minute Quota (15 RPM): " + guard.getCallsThisMinute() + " / 15 used (" + guard.getRemainingCallsThisMinute() + " remaining)");
+        System.out.println("  Daily Quota (1500 RPD): " + guard.getDailyCallCount() + " / 1500 used (" + guard.getRemainingCallsToday() + " remaining)");
+        System.out.println("  Routing Status       : " + (guard.shouldFallbackToOllama() ? "ROUTING TO OLLAMA (Rate threshold protection active)" : "GREEN (Within free tier headroom)"));
+        System.out.println("  Total Bill / Cost    : $0.00 (Guaranteed 100% Free)");
+        System.out.println("==================================================");
+    }
+
     public ProviderConfig getProviderConfig() {
         return providerConfig;
     }
@@ -1263,6 +1321,9 @@ public class SovereignReplRunner {
               processes               List top active processes
               status                  Check Sovereign Operator runtime status and session uptime
               voice-status            Inspect speech-to-text tiers, Whisper model, and Vosk status
+              quota / rate-limit      Inspect 15 RPM / 1500 RPD Gemini free tier usage and Ollama safety
+              generate <spec>         Autonomous code generation with compile verification
+              test-gen <source>       Autonomous JUnit 5 test generation and execution
               keys                    Inspect LLM provider detection, active router chain, and masked keys
               ingest <path> [prompt]  Analyze image, PDF, or document via multimodal AI
               screenshot [prompt]     Capture desktop screen and analyze with Gemini Vision

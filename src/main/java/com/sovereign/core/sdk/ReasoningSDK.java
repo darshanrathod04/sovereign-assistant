@@ -174,8 +174,9 @@ public class ReasoningSDK {
         String promptStr = fullPrompt.toString();
 
         // Tier 1 — Gemini free tier with true structured multi-turn contents[].
-        if (geminiChatProvider != null) {
+        if (geminiChatProvider != null && !com.sovereign.core.config.RateLimitGuard.getInstance().shouldFallbackToOllama()) {
             try {
+                com.sovereign.core.config.RateLimitGuard.getInstance().recordGeminiCall();
                 String geminiReply = geminiChatProvider.chat(systemPrompt, prompt,
                         turns != null ? turns : Collections.emptyList());
                 if (com.sovereign.core.client.GeminiChatProvider.RATE_LIMITED_MARKER.equals(geminiReply)) {
