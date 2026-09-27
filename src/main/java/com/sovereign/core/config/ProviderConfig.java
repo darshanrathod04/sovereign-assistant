@@ -212,6 +212,14 @@ public class ProviderConfig {
         return hasAnyKey();
     }
 
+    /**
+     * Checks if a local Ollama server is running on localhost:11434.
+     * Provides a zero-cost local LLM fallback without requiring cloud API keys.
+     */
+    public boolean isOllamaAvailable() {
+        return com.sovereign.core.client.OllamaProvider.isAvailable();
+    }
+
     public String getGeminiApiKey() {
         return geminiApiKey;
     }

@@ -46,6 +46,12 @@ public class ReasoningSDK {
     /** Optional Ollama local LLM (zero-cost offline fallback). */
     private final com.sovereign.core.client.OllamaProvider ollamaProvider;
 
+    /**
+     * Optional direct Gemini REST chat tier (free tier) that transmits the full
+     * structured multi-turn conversation history as Gemini {@code contents[]}.
+     */
+    private final com.sovereign.core.client.GeminiChatProvider geminiChatProvider;
+
     public ReasoningSDK() {
         this(new DefaultReasoningEngine(), null, null);
     }
@@ -59,11 +65,27 @@ public class ReasoningSDK {
     }
 
     public ReasoningSDK(DefaultReasoningEngine engine, ShreeAI shreeAI, DefaultRuntimeService runtimeService) {
+        this(engine, shreeAI, runtimeService, null,
+                com.sovereign.core.client.OllamaProvider.isAvailable());
+    }
+
+    /**
+     * Full provider wiring used by {@link com.sovereign.core.client.SovereignClient}.
+     * The caller supplies the already-resolved Gemini key and cached local Ollama probe,
+     * avoiding duplicate startup probes and ensuring only zero-cost providers are enabled.
+     */
+    public ReasoningSDK(DefaultReasoningEngine engine, ShreeAI shreeAI,
+                        DefaultRuntimeService runtimeService, String geminiApiKey,
+                        boolean ollamaAvailable) {
         this.engine = Objects.requireNonNull(engine, "DefaultReasoningEngine must not be null");
         this.shreeAI = shreeAI;
         this.runtimeService = runtimeService;
-        // Probe Ollama at construction time — non-blocking, fails silently
-        if (com.sovereign.core.client.OllamaProvider.isAvailable()) {
+
+        this.geminiChatProvider = (geminiApiKey != null && !geminiApiKey.isBlank())
+                ? new com.sovereign.core.client.GeminiChatProvider(geminiApiKey)
+                : null;
+
+        if (ollamaAvailable) {
             this.ollamaProvider = new com.sovereign.core.client.OllamaProvider();
             LOG.info("[SOVEREIGN] Ollama local LLM detected: " + ollamaProvider.getModel()
                     + " — offline fallback enabled (zero cost).");
@@ -127,6 +149,9 @@ public class ReasoningSDK {
         }
 
         String systemPrompt = buildSystemPrompt(userName);
+        if (context != null && !context.isBlank()) {
+            systemPrompt += "\n\nTrusted grounding context:\n" + context.trim();
+        }
 
         // Build a combined full prompt for providers that don't support structured history
         StringBuilder fullPrompt = new StringBuilder();
@@ -148,7 +173,32 @@ public class ReasoningSDK {
 
         String promptStr = fullPrompt.toString();
 
-        // Tier 1 — Platform runtime service (Gemini / OpenAI via Shree AI OS)
+        // Tier 1 — Gemini free tier with true structured multi-turn contents[].
+        if (geminiChatProvider != null) {
+            try {
+                String geminiReply = geminiChatProvider.chat(systemPrompt, prompt,
+                        turns != null ? turns : Collections.emptyList());
+                if (com.sovereign.core.client.GeminiChatProvider.RATE_LIMITED_MARKER.equals(geminiReply)) {
+                    LOG.warning("[SOVEREIGN] Gemini free tier rate limit reached; trying local fallback.");
+                } else if (geminiReply != null && !geminiReply.isBlank()) {
+                    return ReasoningOutputSanitizer.sanitize(geminiReply, prompt, context);
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Tier 2 — Ollama local LLM (zero-cost offline fallback).
+        if (ollamaProvider != null) {
+            try {
+                String ollamaReply = ollamaProvider.chat(systemPrompt, prompt,
+                        turns != null ? turns : Collections.emptyList());
+                if (ollamaReply != null && !ollamaReply.isBlank()) {
+                    LOG.info("[SOVEREIGN] Ollama answered: " + ollamaReply.length() + " chars.");
+                    return ReasoningOutputSanitizer.sanitize(ollamaReply, prompt, context);
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Tier 3 — Platform runtime service (existing Shree AI OS local runtime).
         if (runtimeService != null) {
             try {
                 if (runtimeService.getRuntimeState() == RuntimeState.STARTED
@@ -166,7 +216,7 @@ public class ReasoningSDK {
             } catch (Exception ignored) {}
         }
 
-        // Tier 2 — ShreeAI chat facade
+        // Tier 4 — ShreeAI chat facade
         if (shreeAI != null) {
             try {
                 SDKResponse response = ReasoningOutputSanitizer.executeSilently(
@@ -177,19 +227,7 @@ public class ReasoningSDK {
             } catch (Exception ignored) {}
         }
 
-        // Tier 3 — Ollama local LLM (zero-cost offline fallback)
-        if (ollamaProvider != null) {
-            try {
-                String ollamaReply = ollamaProvider.chat(systemPrompt, prompt,
-                        turns != null ? turns : Collections.emptyList());
-                if (ollamaReply != null && !ollamaReply.isBlank()) {
-                    LOG.info("[SOVEREIGN] Ollama answered: " + ollamaReply.length() + " chars.");
-                    return ReasoningOutputSanitizer.sanitize(ollamaReply, prompt, context);
-                }
-            } catch (Exception ignored) {}
-        }
-
-        // Tier 4 — Deterministic DefaultReasoningEngine
+        // Tier 5 — Deterministic DefaultReasoningEngine
         try {
             ReasoningResult result = engine.reason(prompt, Collections.emptyList(), Collections.emptyList());
             if (result != null && result.conclusion() != null && !result.conclusion().isBlank()) {

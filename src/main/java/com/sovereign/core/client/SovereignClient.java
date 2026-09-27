@@ -113,7 +113,9 @@ public class SovereignClient implements AutoCloseable {
         ReasoningSDK reasoningSdk = new ReasoningSDK(
                 new com.shreeai.os.platform.kernels.cognitive.engine.DefaultReasoningEngine(),
                 shreeAI,
-                runtimeService
+                runtimeService,
+                providerConfig.getGeminiApiKey(),
+                providerConfig.isOllamaAvailable()
         );
         DeveloperSDK developerSdk = new DeveloperSDK();
 

@@ -3,4 +3,6 @@ target/
 *.iml
 .env
 *.env
+*.log
+hs_err_pid*.log
 

@@ -114,15 +114,41 @@ public class ConversationContextWindow {
      * </pre>
      */
     public synchronized String toGeminiContentsJson() {
-        if (turns.isEmpty()) return "[]";
+        return toGeminiContentsJson(turns);
+    }
+
+    /**
+     * Builds a Gemini {@code contents[]} JSON array from an arbitrary turn list.
+     *
+     * <p>This is the single source of truth for Gemini role mapping
+     * ({@code assistant → model}, {@code user → user}) and JSON escaping — it is
+     * used in production by {@code GeminiChatProvider} to serialize the
+     * multi-turn conversation into the {@code generateContent} request body.</p>
+     *
+     * @param turns conversation history, oldest first (null/empty yields {@code []})
+     * @return a JSON array string, e.g.
+     *         {@code [{"role":"user","parts":[{"text":"hi"}]}]}
+     */
+    public static String toGeminiContentsJson(List<ConversationTurn> turns) {
+        if (turns == null || turns.isEmpty()) return "[]";
         return turns.stream()
-                .map(t -> {
-                    // Gemini uses "model" not "assistant"
-                    String geminiRole = "assistant".equals(t.role()) ? "model" : "user";
-                    String escaped = escapeJson(t.content());
-                    return "{\"role\":\"" + geminiRole + "\",\"parts\":[{\"text\":\"" + escaped + "\"}]}";
-                })
+                .filter(t -> t != null && t.content() != null && !t.content().isBlank())
+                .map(ConversationContextWindow::toGeminiContentEntry)
                 .collect(Collectors.joining(",\n", "[\n", "\n]"));
+    }
+
+    /**
+     * Serializes a single turn as a Gemini {@code contents[]} entry.
+     *
+     * @param turn the turn to serialize (must not be null)
+     * @return {@code {"role":"user","parts":[{"text":"..."}]}} with {@code model}
+     *         used for assistant turns
+     */
+    public static String toGeminiContentEntry(ConversationTurn turn) {
+        // Gemini uses "model" not "assistant"
+        String geminiRole = "assistant".equals(turn.role()) ? "model" : "user";
+        String escaped = escapeJson(turn.content());
+        return "{\"role\":\"" + geminiRole + "\",\"parts\":[{\"text\":\"" + escaped + "\"}]}";
     }
 
     // ─── Private ─────────────────────────────────────────────────────────────

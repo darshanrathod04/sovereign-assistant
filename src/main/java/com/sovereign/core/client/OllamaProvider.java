@@ -153,8 +153,11 @@ public class OllamaProvider {
     /**
      * Builds the Ollama {@code /api/chat} JSON request body.
      * Uses the OpenAI-compatible messages format that Ollama supports.
+     *
+     * <p>Exposed for deterministic unit testing of the request serialization
+     * (no network access required).</p>
      */
-    private String buildChatRequest(String systemPrompt, String userMessage,
+    public String buildChatRequest(String systemPrompt, String userMessage,
                                      List<com.sovereign.core.memory.ConversationTurn> history) {
         StringBuilder messages = new StringBuilder("[");
 
@@ -164,19 +167,30 @@ public class OllamaProvider {
                     .append(jsonString(systemPrompt)).append("}");
         }
 
-        // History turns
-        if (history != null) {
-            for (com.sovereign.core.memory.ConversationTurn turn : history) {
-                if (messages.length() > 1) messages.append(",");
-                String ollamaRole = "assistant".equals(turn.role()) ? "assistant" : "user";
-                messages.append("{\"role\":\"").append(ollamaRole).append("\",\"content\":")
-                        .append(jsonString(turn.content())).append("}");
-            }
+        // Prior conversation turns. The REPL may already include the current
+        // user turn, so never append the same message twice.
+        List<com.sovereign.core.memory.ConversationTurn> turns =
+                history != null ? new java.util.ArrayList<>(history) : new java.util.ArrayList<>();
+        boolean currentAlreadyPresent = !turns.isEmpty();
+        if (currentAlreadyPresent) {
+            com.sovereign.core.memory.ConversationTurn last = turns.get(turns.size() - 1);
+            currentAlreadyPresent = last != null
+                    && "user".equals(last.role())
+                    && last.content() != null
+                    && last.content().trim().equals(userMessage == null ? "" : userMessage.trim());
+        }
+        if (!currentAlreadyPresent) {
+            turns.add(com.sovereign.core.memory.ConversationTurn.user(userMessage));
         }
 
-        // Current user message
-        if (messages.length() > 1) messages.append(",");
-        messages.append("{\"role\":\"user\",\"content\":").append(jsonString(userMessage)).append("}");
+        for (com.sovereign.core.memory.ConversationTurn turn : turns) {
+            if (turn == null || turn.content() == null) continue;
+            if (messages.length() > 1) messages.append(",");
+            String ollamaRole = "assistant".equals(turn.role()) ? "assistant" : "user";
+            messages.append("{\"role\":\"").append(ollamaRole).append("\",\"content\":")
+                    .append(jsonString(turn.content())).append("}");
+        }
+
         messages.append("]");
 
         return "{\"model\":\"" + model + "\","
