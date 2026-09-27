@@ -10,9 +10,11 @@ import com.sovereign.core.intent.UserIntentType;
 import com.sovereign.core.memory.ConversationContextWindow;
 import com.sovereign.core.memory.ConversationTurn;
 import com.sovereign.core.memory.EpisodicSessionLedger;
+import com.sovereign.core.memory.KnowledgeGraphStore;
 import com.sovereign.core.memory.ProceduralSkillStore;
 import com.sovereign.core.memory.SessionStore;
 import com.sovereign.core.memory.UserMemoryProfile;
+import com.sovereign.core.memory.VectorMemoryStore;
 import com.sovereign.core.react.engine.AutonomousOperator;
 import com.sovereign.core.react.model.GoalStatus;
 import com.sovereign.core.react.model.OperatorEvent;
@@ -84,6 +86,12 @@ public class SovereignReplRunner {
     /** Persists conversation turns to ~/.sovereign/sessions/ across restarts. */
     private final SessionStore sessionStore;
 
+    /** Zero-cost semantic vector memory store for long-term fact & context recall. */
+    private final VectorMemoryStore vectorMemory;
+
+    /** Knowledge graph store holding structured relational facts and profile triples. */
+    private final KnowledgeGraphStore knowledgeGraph;
+
     public SovereignReplRunner() {
         this(ProviderConfig.load());
     }
@@ -101,6 +109,18 @@ public class SovereignReplRunner {
         this.voiceConfig = VoiceConfig.defaultConfig();
         this.sttAdapter = new SpeechToTextAdapter(voiceConfig);
         this.ttsSynthesizer = new TextToSpeechSynthesizer(voiceConfig);
+
+        // ── Phase 2: Vector Memory & Knowledge Graph ───────────────────────
+        this.vectorMemory = new VectorMemoryStore();
+        this.knowledgeGraph = new KnowledgeGraphStore();
+
+        // Seed initial profile knowledge facts if knowledge graph is empty
+        if (knowledgeGraph.size() == 0) {
+            String name = userProfile.getUserName() != null ? userProfile.getUserName() : "Darshan";
+            knowledgeGraph.addFact(name, "prefers_editor", userProfile.getPreferredEditor(), 1.0);
+            knowledgeGraph.addFact(name, "prefers_shell", userProfile.getPreferredShell(), 1.0);
+            knowledgeGraph.addFact("sovereign", "persona", "JARVIS", 1.0);
+        }
 
         // ── Multi-turn context window + session persistence ────────────────
         this.contextWindow = new ConversationContextWindow();
@@ -586,7 +606,7 @@ public class SovereignReplRunner {
         switch (classification.intentType()) {
             case CHAT -> {
                 ensureClient();
-                String grounding = buildChatGroundingContext();
+                String grounding = buildChatGroundingContext(normalized);
                 String reply = null;
 
                 // Record user turn in context window BEFORE calling LLM
@@ -616,6 +636,11 @@ public class SovereignReplRunner {
                 sessionStore.append(ConversationTurn.assistant(reply));
                 sessionStore.save(); // persist after every exchange
 
+                // Store substantive user statements for semantic long-term recall
+                if (normalized.length() > 20 && !normalized.toLowerCase().startsWith("what") && !normalized.toLowerCase().startsWith("how")) {
+                    vectorMemory.store(normalized, "chat_statement");
+                }
+
                 System.out.println(reply);
                 if (ambientVoiceEnabled && ttsSynthesizer != null) {
                     ttsSynthesizer.speak(reply);
@@ -643,6 +668,8 @@ public class SovereignReplRunner {
                         userProfile.saveToFile(UserMemoryProfile.DEFAULT_PROFILE_PATH);
                     } catch (Exception ignored) {
                     }
+                    knowledgeGraph.addFact(name, "identity", "user", 1.0);
+                    vectorMemory.store("User's name is " + name + ".", "profile");
                     String reply = "Nice to meet you, " + name + ". I've updated my memory with your name.";
                     System.out.println(reply);
                     if (ambientVoiceEnabled) ttsSynthesizer.speak(reply);
@@ -685,6 +712,9 @@ public class SovereignReplRunner {
                         userProfile.saveToFile(UserMemoryProfile.DEFAULT_PROFILE_PATH);
                     } catch (Exception ignored) {
                     }
+                    String user = userProfile.getUserName() != null ? userProfile.getUserName() : "user";
+                    knowledgeGraph.addFact(user, "prefers_" + k, v, 1.0);
+                    vectorMemory.store("User preference: " + k + " is " + v + ".", "preference");
                     String reply = "I have updated your " + k + " preference to: " + v;
                     System.out.println(reply);
                     if (ambientVoiceEnabled) ttsSynthesizer.speak(reply);
@@ -780,6 +810,10 @@ public class SovereignReplRunner {
     }
 
     public String buildChatGroundingContext() {
+        return buildChatGroundingContext(null);
+    }
+
+    public String buildChatGroundingContext(String query) {
         StringBuilder sb = new StringBuilder();
         String userName = userProfile.getUserName();
         sb.append("User: ").append(userName != null && !userName.isBlank() ? userName : "Darshan").append("\n");
@@ -791,6 +825,24 @@ public class SovereignReplRunner {
                     .append(" (").append(ctx.buildTool())
                     .append(", ").append(ctx.detectedFramework())
                     .append(", Roots: ").append(ctx.sourceDirectories()).append(")\n");
+        }
+        if (query != null && !query.isBlank() && vectorMemory != null) {
+            var searchResults = vectorMemory.search(query, 3, 0.25f);
+            if (!searchResults.isEmpty()) {
+                sb.append("Semantic Long-Term Recall:\n");
+                for (var r : searchResults) {
+                    sb.append("  - ").append(r.record().text).append("\n");
+                }
+            }
+        }
+        if (query != null && !query.isBlank() && knowledgeGraph != null) {
+            var facts = knowledgeGraph.findFactsMatching(query);
+            if (!facts.isEmpty()) {
+                sb.append("Knowledge Graph Relations:\n");
+                for (var f : facts.stream().limit(5).toList()) {
+                    sb.append("  - ").append(f.toString()).append("\n");
+                }
+            }
         }
         if (!conversationHistory.isEmpty()) {
             sb.append("Recent Dialogue History:\n");
@@ -889,6 +941,16 @@ public class SovereignReplRunner {
         System.out.println("\n=== PROCEDURAL SKILLS ===");
         skillStore.getAllSkills().forEach((name, def) ->
                 System.out.printf("  Skill '%s' -> %s%n", name, def.recipe()));
+
+        System.out.println("\n=== VECTOR MEMORY STORE ===");
+        System.out.printf("Indexed Semantic Memories: %d%n", vectorMemory.size());
+        vectorMemory.getAllRecords().stream().limit(6).forEach(m ->
+                System.out.printf("  [%s] %s (accessed %dx)%n", m.category, m.text, m.accessCount));
+
+        System.out.println("\n=== KNOWLEDGE GRAPH FACTS ===");
+        System.out.printf("Relational Triples: %d%n", knowledgeGraph.size());
+        knowledgeGraph.getAllFacts().stream().limit(8).forEach(f ->
+                System.out.printf("  %s (conf: %.1f)%n", f.toString(), f.confidence));
     }
 
     public void printContext() {
