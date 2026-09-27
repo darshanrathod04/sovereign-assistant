@@ -253,6 +253,11 @@ public class SovereignReplRunner {
             return 0;
         }
 
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("voice-status") || args[startIndex].equalsIgnoreCase("stt-status"))) {
+            printVoiceStatus();
+            return 0;
+        }
+
         if (startIndex < args.length && args[startIndex].equalsIgnoreCase("keys")) {
             printKeys();
             return 0;
@@ -738,6 +743,8 @@ public class SovereignReplRunner {
                 } else {
                     System.err.println("Usage: github <search|issues> <args>");
                 }
+            } else if (line.equalsIgnoreCase("voice-status") || line.equalsIgnoreCase("stt-status")) {
+                printVoiceStatus();
             } else if (line.equalsIgnoreCase("keys") || line.equalsIgnoreCase("sovereign keys")) {
                 printKeys();
             } else {
@@ -1218,6 +1225,23 @@ public class SovereignReplRunner {
         ));
     }
 
+    public void printVoiceStatus() {
+        com.sovereign.core.voice.AudioTranscriptionService stt = sttAdapter.getTranscriptionService();
+        boolean isWin = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+        System.out.println("==================================================");
+        System.out.println("  SOVEREIGN SPEECH & VOICE INTELLIGENCE (PHASE 5)");
+        System.out.println("==================================================");
+        System.out.println("  Active STT Tier      : " + (stt != null ? stt.getActiveTier() : "unavailable"));
+        System.out.println("  Gemini Free STT      : " + (providerConfig.hasGeminiKey() ? "Configured & Ready" : "No API key (offline)"));
+        System.out.println("  Whisper Local STT    : " + (stt != null && stt.isWhisperAvailable() ? "Available (CLI found)" : "Not installed (faster-whisper / whisper)"));
+        System.out.println("    Whisper Model      : " + com.sovereign.core.voice.AudioTranscriptionService.resolveWhisperModel());
+        System.out.println("    Whisper Language   : " + com.sovereign.core.voice.AudioTranscriptionService.resolveWhisperLanguage());
+        System.out.println("  Vosk Offline STT     : " + (stt != null && stt.getVoskRecognizer().isAvailable() ? "Model Available (" + stt.getVoskRecognizer().getModelPath() + ")" : "Model not found (~/.sovereign/models/vosk)"));
+        System.out.println("  Windows SAPI (Local) : " + (isWin ? "Available (built-in Windows)" : "Unavailable (non-Windows)"));
+        System.out.println("  TTS Speech Engine    : Windows SAPI (Rate: " + voiceConfig.getVoiceRate() + ", Volume: " + voiceConfig.getVolume() + ")");
+        System.out.println("==================================================");
+    }
+
     public ProviderConfig getProviderConfig() {
         return providerConfig;
     }
@@ -1238,6 +1262,7 @@ public class SovereignReplRunner {
               learn <alias>=<goal>    Save reusable procedural skill
               processes               List top active processes
               status                  Check Sovereign Operator runtime status and session uptime
+              voice-status            Inspect speech-to-text tiers, Whisper model, and Vosk status
               keys                    Inspect LLM provider detection, active router chain, and masked keys
               ingest <path> [prompt]  Analyze image, PDF, or document via multimodal AI
               screenshot [prompt]     Capture desktop screen and analyze with Gemini Vision

@@ -79,18 +79,65 @@ public class AudioTranscriptionService {
             "If the audio is pure background noise or silence, return '[SILENCE]'.";
 
     private final ProviderConfig config;
+    private final VoskSpeechRecognizer voskRecognizer;
 
     public AudioTranscriptionService() {
-        this(ProviderConfig.load());
+        this(ProviderConfig.load(), new VoskSpeechRecognizer());
     }
 
     public AudioTranscriptionService(ProviderConfig config) {
+        this(config, new VoskSpeechRecognizer());
+    }
+
+    public AudioTranscriptionService(ProviderConfig config, VoskSpeechRecognizer voskRecognizer) {
         this.config = config != null ? config : ProviderConfig.of(null, null);
+        this.voskRecognizer = voskRecognizer != null ? voskRecognizer : new VoskSpeechRecognizer();
+    }
+
+    public VoskSpeechRecognizer getVoskRecognizer() {
+        return voskRecognizer;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Public API
     // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Resolves the configured Whisper model name (e.g. tiny, small, medium).
+     */
+    public static String resolveWhisperModel() {
+        String prop = System.getProperty("sovereign.whisper.model");
+        if (prop != null && !prop.isBlank()) return prop.trim();
+
+        String env = System.getenv("SOVEREIGN_WHISPER_MODEL");
+        if (env != null && !env.isBlank()) return env.trim();
+
+        return "small";
+    }
+
+    /**
+     * Resolves the configured Whisper language code (e.g. en, hi).
+     */
+    public static String resolveWhisperLanguage() {
+        String prop = System.getProperty("sovereign.whisper.language");
+        if (prop != null && !prop.isBlank()) return prop.trim();
+
+        String env = System.getenv("SOVEREIGN_WHISPER_LANGUAGE");
+        if (env != null && !env.isBlank()) return env.trim();
+
+        return "en";
+    }
+
+    /**
+     * Returns the name of the highest-priority active speech recognition tier.
+     */
+    public String getActiveTier() {
+        if (config.hasGeminiKey()) return "gemini";
+        if (isWhisperAvailable()) return "whisper";
+        if (voskRecognizer.isAvailable()) return "vosk";
+        if (isWindows()) return "sapi";
+        return "heuristic";
+    }
 
     /**
      * Resolves the Gemini STT model name at runtime:
@@ -131,20 +178,34 @@ public class AudioTranscriptionService {
         if (config.hasGeminiKey()) {
             String result = transcribeWithGemini(wavBytes, config.getGeminiApiKey());
             if (RATE_LIMITED_MARKER.equals(result)) {
-                return RATE_LIMITED_MARKER; // propagate to caller for backoff
+                // When rate-limited, attempt offline Whisper/Vosk fallback before failing
+                if (isWhisperAvailable()) {
+                    String whisperRes = transcribeWithWhisper(wavBytes);
+                    if (whisperRes != null && !whisperRes.isBlank()) return sanitize(whisperRes);
+                }
+                if (voskRecognizer.isAvailable()) {
+                    String voskRes = voskRecognizer.transcribe(wavBytes);
+                    if (voskRes != null && !voskRes.isBlank()) return sanitize(voskRes);
+                }
+                return RATE_LIMITED_MARKER;
             }
             if (result != null) {
                 return sanitize(result);
             }
-            // Gemini key is present but all attempts failed.
-            // Deliberately do NOT fall through to SAPI: Windows SAPI dictation produces
-            // phonetic nonsense on non-US/Indian accents ("Ernest ward has a lot").
-            // Return [SILENCE] so the ambient loop skips this turn cleanly.
+            // If Gemini is configured but failed (network down / 404): try local Whisper or Vosk
+            if (isWhisperAvailable()) {
+                String whisperRes = transcribeWithWhisper(wavBytes);
+                if (whisperRes != null && !whisperRes.isBlank()) return sanitize(whisperRes);
+            }
+            if (voskRecognizer.isAvailable()) {
+                String voskRes = voskRecognizer.transcribe(wavBytes);
+                if (voskRes != null && !voskRes.isBlank()) return sanitize(voskRes);
+            }
             LOG.warning("[STT] Gemini transcription failed with key present — returning [SILENCE] to protect downstream.");
             return SILENCE_MARKER;
         }
 
-        // Tier 2 — Local Whisper CLI (only when Gemini key is absent)
+        // Tier 2 — Local Whisper CLI
         if (isWhisperAvailable()) {
             String result = transcribeWithWhisper(wavBytes);
             if (result != null && !result.isBlank()) {
@@ -152,9 +213,15 @@ public class AudioTranscriptionService {
             }
         }
 
-        // Tier 3 — Windows SAPI offline (PowerShell System.Speech)
-        // ONLY reached when no Gemini key is present (no cloud STT configured at all).
-        // When Gemini is configured, SAPI is bypassed unconditionally — see above.
+        // Tier 3 — Local Vosk speech recognizer
+        if (voskRecognizer.isAvailable()) {
+            String result = voskRecognizer.transcribe(wavBytes);
+            if (result != null && !result.isBlank()) {
+                return sanitize(result);
+            }
+        }
+
+        // Tier 4 — Windows SAPI offline (PowerShell System.Speech)
         if (isWindows()) {
             String result = transcribeWithWindowsSapi(wavBytes);
             if (result != null && !result.isBlank()) {
@@ -289,7 +356,7 @@ public class AudioTranscriptionService {
     // Tier 2: Local Whisper CLI
     // ─────────────────────────────────────────────────────────────────────────
 
-    boolean isWhisperAvailable() {
+    public boolean isWhisperAvailable() {
         return probeCommand("whisper") || probeCommand("faster-whisper");
     }
 
@@ -302,15 +369,28 @@ public class AudioTranscriptionService {
             tempOut = Files.createTempDirectory("sovereign_whisper_");
 
             String whisperBin = probeCommand("faster-whisper") ? "faster-whisper" : "whisper";
-            ProcessBuilder pb = new ProcessBuilder(
-                    whisperBin,
-                    tempWav.toAbsolutePath().toString(),
-                    "--output_format", "txt",
-                    "--output_dir", tempOut.toAbsolutePath().toString()
-            );
+            String model = resolveWhisperModel();
+            String lang = resolveWhisperLanguage();
+
+            java.util.List<String> command = new java.util.ArrayList<>();
+            command.add(whisperBin);
+            command.add(tempWav.toAbsolutePath().toString());
+            command.add("--model");
+            command.add(model);
+            command.add("--output_format");
+            command.add("txt");
+            command.add("--output_dir");
+            command.add(tempOut.toAbsolutePath().toString());
+
+            if (lang != null && !lang.isBlank() && !"auto".equalsIgnoreCase(lang)) {
+                command.add("--language");
+                command.add(lang);
+            }
+
+            ProcessBuilder pb = new ProcessBuilder(command);
             pb.redirectErrorStream(true);
             Process proc = pb.start();
-            boolean done = proc.waitFor(20, TimeUnit.SECONDS);
+            boolean done = proc.waitFor(30, TimeUnit.SECONDS);
             if (!done) {
                 proc.destroyForcibly();
                 return null;

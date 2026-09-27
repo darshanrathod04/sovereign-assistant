@@ -50,6 +50,10 @@ public class SpeechToTextAdapter {
                 providerConfig != null ? providerConfig : ProviderConfig.load());
     }
 
+    public AudioTranscriptionService getTranscriptionService() {
+        return transcriptionService;
+    }
+
     /**
      * Transcribes an InputStream containing audio bytes or a mock audio stream.
      */
