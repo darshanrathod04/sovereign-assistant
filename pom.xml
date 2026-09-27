@@ -40,6 +40,13 @@
             <artifactId>spring-boot-starter</artifactId>
         </dependency>
 
+        <!-- Zero-Cost PDF Text Extraction (Apache PDFBox) -->
+        <dependency>
+            <groupId>org.apache.pdfbox</groupId>
+            <artifactId>pdfbox</artifactId>
+            <version>3.0.4</version>
+        </dependency>
+
         <!-- Testing -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>

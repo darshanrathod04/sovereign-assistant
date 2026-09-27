@@ -21,7 +21,10 @@ import com.sovereign.core.react.model.OperatorEvent;
 import com.sovereign.core.react.planner.GoalDecomposer;
 import com.sovereign.core.react.recovery.CausalErrorRecoveryEngine;
 import com.sovereign.core.tools.FileSystemTool;
+import com.sovereign.core.tools.LogAnalyzerTool;
+import com.sovereign.core.tools.MultimodalIngestTool;
 import com.sovereign.core.tools.ProcessControlTool;
+import com.sovereign.core.tools.ScreenCaptureTool;
 import com.sovereign.core.tools.ShellExecutionTool;
 import com.sovereign.core.voice.MicrophoneAudioCapture;
 import com.sovereign.core.voice.SpeechToTextAdapter;
@@ -61,6 +64,9 @@ public class SovereignReplRunner {
     private final ShellExecutionTool shellTool;
     private final FileSystemTool fileSystemTool;
     private final ProcessControlTool processControlTool;
+    private final MultimodalIngestTool multimodalTool;
+    private final ScreenCaptureTool screenCaptureTool;
+    private final LogAnalyzerTool logAnalyzerTool;
 
     private final UserMemoryProfile userProfile;
     private final ProceduralSkillStore skillStore;
@@ -100,6 +106,9 @@ public class SovereignReplRunner {
         this.shellTool = new ShellExecutionTool();
         this.fileSystemTool = new FileSystemTool();
         this.processControlTool = new ProcessControlTool();
+        this.multimodalTool = new MultimodalIngestTool();
+        this.screenCaptureTool = new ScreenCaptureTool(multimodalTool);
+        this.logAnalyzerTool = new LogAnalyzerTool();
         this.userProfile = UserMemoryProfile.createDefault();
         this.skillStore = ProceduralSkillStore.createDefault();
         this.contextIndexer = new WorkspaceContextIndexer();
@@ -254,6 +263,45 @@ public class SovereignReplRunner {
             }
             handleLearn(sb.toString().trim());
             return 0;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("ingest") || args[startIndex].equalsIgnoreCase("see"))) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Usage: sovereign ingest <path> [prompt]");
+                return 1;
+            }
+            java.nio.file.Path p = java.nio.file.Path.of(args[startIndex + 1]);
+            String prompt = (startIndex + 2 < args.length) ? args[startIndex + 2] : null;
+            var res = multimodalTool.ingest(p, prompt);
+            System.out.println(res.summary());
+            return res.success() ? 0 : 1;
+        }
+
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("screenshot")) {
+            String prompt = (startIndex + 1 < args.length) ? args[startIndex + 1] : null;
+            var res = screenCaptureTool.captureAndAnalyze(prompt);
+            System.out.println(res.analysis());
+            return res.success() ? 0 : 1;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("analyze-log") || args[startIndex].equalsIgnoreCase("diagnose"))) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Usage: sovereign analyze-log <path>");
+                return 1;
+            }
+            try {
+                var res = logAnalyzerTool.analyzeLogFile(java.nio.file.Path.of(args[startIndex + 1]));
+                System.out.println("=== LOG DIAGNOSTIC REPORT ===");
+                System.out.println("Failure Detected: " + res.isFailure());
+                System.out.println("Error Type      : " + res.errorType());
+                if (res.sourceFile() != null) System.out.println("Offending File  : " + res.sourceFile() + ":" + res.lineNumber());
+                System.out.println("Summary         : " + res.summary());
+                System.out.println("Recommendation  : " + res.suggestion());
+                return res.isFailure() ? 1 : 0;
+            } catch (Exception e) {
+                System.err.println("Failed to analyze log: " + e.getMessage());
+                return 1;
+            }
         }
 
         if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("repl") || args[startIndex].equalsIgnoreCase("interactive"))) {
@@ -580,6 +628,30 @@ public class SovereignReplRunner {
                 handleProcesses();
             } else if (line.equalsIgnoreCase("status")) {
                 handleStatus();
+            } else if (line.startsWith("ingest ") || line.startsWith("see ")) {
+                String arg = line.startsWith("ingest ") ? line.substring(7).trim() : line.substring(4).trim();
+                int sp = arg.indexOf(' ');
+                java.nio.file.Path p = java.nio.file.Path.of(sp == -1 ? arg : arg.substring(0, sp).trim());
+                String prompt = sp == -1 ? null : arg.substring(sp + 1).trim();
+                var res = multimodalTool.ingest(p, prompt);
+                System.out.println(res.summary());
+            } else if (line.equalsIgnoreCase("screenshot") || line.startsWith("screenshot ")) {
+                String prompt = line.length() > 10 ? line.substring(11).trim() : null;
+                var res = screenCaptureTool.captureAndAnalyze(prompt);
+                System.out.println(res.analysis());
+            } else if (line.startsWith("analyze-log ") || line.startsWith("diagnose ")) {
+                String pathStr = line.startsWith("analyze-log ") ? line.substring(12).trim() : line.substring(9).trim();
+                try {
+                    var res = logAnalyzerTool.analyzeLogFile(java.nio.file.Path.of(pathStr));
+                    System.out.println("=== LOG DIAGNOSTIC REPORT ===");
+                    System.out.println("Failure Detected: " + res.isFailure());
+                    System.out.println("Error Type      : " + res.errorType());
+                    if (res.sourceFile() != null) System.out.println("Offending File  : " + res.sourceFile() + ":" + res.lineNumber());
+                    System.out.println("Summary         : " + res.summary());
+                    System.out.println("Recommendation  : " + res.suggestion());
+                } catch (Exception e) {
+                    System.err.println("Failed to analyze log: " + e.getMessage());
+                }
             } else if (line.equalsIgnoreCase("keys") || line.equalsIgnoreCase("sovereign keys")) {
                 printKeys();
             } else {
@@ -1081,6 +1153,9 @@ public class SovereignReplRunner {
               processes               List top active processes
               status                  Check Sovereign Operator runtime status and session uptime
               keys                    Inspect LLM provider detection, active router chain, and masked keys
+              ingest <path> [prompt]  Analyze image, PDF, or document via multimodal AI
+              screenshot [prompt]     Capture desktop screen and analyze with Gemini Vision
+              analyze-log <path>      Diagnose build errors, stack traces, and test failures
               help                    Show this help message
               exit / quit             Exit REPL
             """);
