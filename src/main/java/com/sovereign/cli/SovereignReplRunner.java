@@ -33,6 +33,7 @@ import com.sovereign.core.tools.ShellExecutionTool;
 import com.sovereign.core.tools.TestGenerationTool;
 import com.sovereign.core.tools.WebPageReaderTool;
 import com.sovereign.core.tools.WebSearchTool;
+import com.sovereign.core.web.SovereignWebDashboard;
 import com.sovereign.core.voice.MicrophoneAudioCapture;
 import com.sovereign.core.voice.SpeechToTextAdapter;
 import com.sovereign.core.voice.TextToSpeechSynthesizer;
@@ -115,6 +116,9 @@ public class SovereignReplRunner {
 
     /** Phase 7: Zero-cost proactive intelligence daemon. */
     private final ProactiveIntelligenceDaemon proactiveDaemon;
+
+    /** Phase 8: Zero-cost embedded web dashboard. */
+    private SovereignWebDashboard webDashboard;
 
     public SovereignReplRunner() {
         this(ProviderConfig.load());
@@ -252,6 +256,10 @@ public class SovereignReplRunner {
 
         if (startIndex < args.length && args[startIndex].equalsIgnoreCase("watch")) {
             return runWatcherDaemon(true);
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("open") || args[startIndex].equalsIgnoreCase("web") || args[startIndex].equalsIgnoreCase("dashboard") || args[startIndex].equalsIgnoreCase("ui"))) {
+            return runWebDashboard(false);
         }
 
         if (startIndex < args.length && args[startIndex].equalsIgnoreCase("memory")) {
@@ -752,6 +760,8 @@ public class SovereignReplRunner {
                 runAmbientVoiceLoop();
             } else if (line.equalsIgnoreCase("watch")) {
                 handleWatchToggle();
+            } else if (line.equalsIgnoreCase("open") || line.equalsIgnoreCase("web") || line.equalsIgnoreCase("dashboard") || line.equalsIgnoreCase("ui")) {
+                handleWebToggle();
             } else if (line.startsWith("read ")) {
                 handleRead(line.substring(5).trim());
             } else if (line.startsWith("write ")) {
@@ -1123,6 +1133,53 @@ public class SovereignReplRunner {
         }
     }
 
+    public synchronized SovereignWebDashboard ensureWebDashboard() {
+        if (webDashboard == null) {
+            webDashboard = new SovereignWebDashboard(this);
+        }
+        return webDashboard;
+    }
+
+    public SovereignWebDashboard getWebDashboard() {
+        return ensureWebDashboard();
+    }
+
+    public void handleWebToggle() {
+        ensureWebDashboard();
+        try {
+            if (!webDashboard.isRunning()) {
+                webDashboard.start();
+                System.out.println("[WEB DASHBOARD] Sovereign Web UI is live at " + webDashboard.getUrl());
+            } else {
+                System.out.println("[WEB DASHBOARD] Web UI is already running at " + webDashboard.getUrl());
+            }
+            webDashboard.openBrowser();
+        } catch (Exception e) {
+            System.err.println("Failed to start Web Dashboard: " + e.getMessage());
+        }
+    }
+
+    public int runWebDashboard(boolean blocking) {
+        ensureWebDashboard();
+        try {
+            if (!webDashboard.isRunning()) {
+                webDashboard.start();
+            }
+            System.out.println("[WEB DASHBOARD] Sovereign Web UI is live at " + webDashboard.getUrl());
+            webDashboard.openBrowser();
+            if (blocking) {
+                System.out.println("Press Enter to stop Web Dashboard...");
+                new Scanner(System.in).nextLine();
+                webDashboard.stop();
+                System.out.println("Web Dashboard stopped.");
+            }
+            return 0;
+        } catch (Exception e) {
+            System.err.println("Failed to run Web Dashboard: " + e.getMessage());
+            return 1;
+        }
+    }
+
     private synchronized SovereignClient ensureClient() {
         if (client == null) {
             try {
@@ -1396,6 +1453,7 @@ public class SovereignReplRunner {
               speak <text>            Synthesize and speak text response (TTS)
               listen                  Enter conversational ambient voice loop with wake-word
               watch                   Toggle background workspace watcher daemon
+              open / web / dashboard  Launch zero-cost localhost:7700 web dashboard co-pilot in browser
               read <file>             Read file within workspace boundary
               write <file> <content>  Write file within workspace boundary
               memory                  List recent episodic goals and active user profile
