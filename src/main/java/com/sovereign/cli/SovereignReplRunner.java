@@ -2,6 +2,7 @@ package com.sovereign.cli;
 
 import com.sovereign.core.client.SovereignClient;
 import com.sovereign.core.config.ProviderConfig;
+import com.sovereign.core.daemon.ProactiveIntelligenceDaemon;
 import com.sovereign.core.daemon.WorkspaceAlert;
 import com.sovereign.core.daemon.WorkspaceWatcherDaemon;
 import com.sovereign.core.intent.IntentClassificationResult;
@@ -9,6 +10,7 @@ import com.sovereign.core.intent.IntentRouter;
 import com.sovereign.core.intent.UserIntentType;
 import com.sovereign.core.memory.ConversationContextWindow;
 import com.sovereign.core.memory.ConversationTurn;
+import com.sovereign.core.memory.CorrectionLedger;
 import com.sovereign.core.memory.EpisodicSessionLedger;
 import com.sovereign.core.memory.KnowledgeGraphStore;
 import com.sovereign.core.memory.ProceduralSkillStore;
@@ -108,6 +110,12 @@ public class SovereignReplRunner {
     /** Knowledge graph store holding structured relational facts and profile triples. */
     private final KnowledgeGraphStore knowledgeGraph;
 
+    /** Phase 7: Self-learning correction ledger. */
+    private final CorrectionLedger correctionLedger;
+
+    /** Phase 7: Zero-cost proactive intelligence daemon. */
+    private final ProactiveIntelligenceDaemon proactiveDaemon;
+
     public SovereignReplRunner() {
         this(ProviderConfig.load());
     }
@@ -137,6 +145,8 @@ public class SovereignReplRunner {
         // ── Phase 2: Vector Memory & Knowledge Graph ───────────────────────
         this.vectorMemory = new VectorMemoryStore();
         this.knowledgeGraph = new KnowledgeGraphStore();
+        this.correctionLedger = new CorrectionLedger();
+        this.proactiveDaemon = new ProactiveIntelligenceDaemon(shellTool, java.nio.file.Paths.get("").toAbsolutePath(), 30_000L);
 
         // Seed initial profile knowledge facts if knowledge graph is empty
         if (knowledgeGraph.size() == 0) {
@@ -292,6 +302,31 @@ public class SovereignReplRunner {
             var res = testGenTool.generateTests(java.nio.file.Path.of(args[startIndex + 1].trim()), null);
             System.out.println(res.formatSummary());
             return res.success() ? 0 : 1;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("rules") || args[startIndex].equalsIgnoreCase("corrections"))) {
+            printRules();
+            return 0;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("proactive") || args[startIndex].equalsIgnoreCase("advise"))) {
+            printProactiveNotices();
+            return 0;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("rule") || args[startIndex].equalsIgnoreCase("teach"))) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Usage: sovereign rule <rule/instruction to remember>");
+                return 1;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = startIndex + 1; i < args.length; i++) {
+                if (!sb.isEmpty()) sb.append(" ");
+                sb.append(args[i]);
+            }
+            correctionLedger.addRule(sb.toString().trim(), "manual");
+            System.out.println("[SELF-LEARNING] Saved new rule: " + sb.toString().trim());
+            return 0;
         }
 
         if (startIndex < args.length && args[startIndex].equalsIgnoreCase("keys")) {
@@ -791,6 +826,14 @@ public class SovereignReplRunner {
                 String p = line.startsWith("test-gen ") ? line.substring(9).trim() : line.substring(14).trim();
                 var res = testGenTool.generateTests(java.nio.file.Path.of(p), null);
                 System.out.println(res.formatSummary());
+            } else if (line.equalsIgnoreCase("rules") || line.equalsIgnoreCase("corrections")) {
+                printRules();
+            } else if (line.equalsIgnoreCase("proactive") || line.equalsIgnoreCase("advise")) {
+                printProactiveNotices();
+            } else if (line.startsWith("rule ") || line.startsWith("teach ")) {
+                String r = line.startsWith("rule ") ? line.substring(5).trim() : line.substring(6).trim();
+                correctionLedger.addRule(r, "manual");
+                System.out.println("[SELF-LEARNING] Saved new rule: " + r);
             } else if (line.equalsIgnoreCase("keys") || line.equalsIgnoreCase("sovereign keys")) {
                 printKeys();
             } else {
@@ -1300,6 +1343,46 @@ public class SovereignReplRunner {
         System.out.println("==================================================");
     }
 
+    public void printRules() {
+        System.out.println("==================================================");
+        System.out.println("  SOVEREIGN LEARNED RULES & PREFERENCES (PHASE 7)");
+        System.out.println("==================================================");
+        var rules = correctionLedger.getRules();
+        if (rules.isEmpty()) {
+            System.out.println("  No active rules learned yet.");
+            System.out.println("  Say e.g. 'always use JUnit 5' or 'prefer 4 spaces'");
+        } else {
+            for (int i = 0; i < rules.size(); i++) {
+                var r = rules.get(i);
+                System.out.printf("  %d. %s (Learned: %s)%n", i + 1, r.rule(), r.learnedAt());
+            }
+        }
+        System.out.println("==================================================");
+    }
+
+    public void printProactiveNotices() {
+        System.out.println("==================================================");
+        System.out.println("  SOVEREIGN PROACTIVE INTELLIGENCE AUDIT (PHASE 7)");
+        System.out.println("==================================================");
+        var notices = proactiveDaemon.inspectWorkspace();
+        if (notices.isEmpty()) {
+            System.out.println("  [HEALTH CHECK] Workspace is clean, healthy, and operational.");
+        } else {
+            for (String n : notices) {
+                System.out.println("  " + n);
+            }
+        }
+        System.out.println("==================================================");
+    }
+
+    public CorrectionLedger getCorrectionLedger() {
+        return correctionLedger;
+    }
+
+    public ProactiveIntelligenceDaemon getProactiveDaemon() {
+        return proactiveDaemon;
+    }
+
     public ProviderConfig getProviderConfig() {
         return providerConfig;
     }
@@ -1324,6 +1407,9 @@ public class SovereignReplRunner {
               quota / rate-limit      Inspect 15 RPM / 1500 RPD Gemini free tier usage and Ollama safety
               generate <spec>         Autonomous code generation with compile verification
               test-gen <source>       Autonomous JUnit 5 test generation and execution
+              rules / corrections     List persistent behavioral rules and preferences
+              proactive / advise      Run proactive workspace and git health audit
+              rule <rule>             Teach Sovereign a persistent rule or preference
               keys                    Inspect LLM provider detection, active router chain, and masked keys
               ingest <path> [prompt]  Analyze image, PDF, or document via multimodal AI
               screenshot [prompt]     Capture desktop screen and analyze with Gemini Vision

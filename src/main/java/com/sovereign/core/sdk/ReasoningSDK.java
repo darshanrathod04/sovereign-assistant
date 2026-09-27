@@ -92,6 +92,13 @@ public class ReasoningSDK {
         } else {
             this.ollamaProvider = null;
         }
+        this.correctionLedger = new com.sovereign.core.memory.CorrectionLedger();
+    }
+
+    private final com.sovereign.core.memory.CorrectionLedger correctionLedger;
+
+    public com.sovereign.core.memory.CorrectionLedger getCorrectionLedger() {
+        return correctionLedger;
     }
 
     private static final java.util.logging.Logger LOG =
@@ -103,15 +110,24 @@ public class ReasoningSDK {
      *   <li>User's name (from the profile, if known)</li>
      *   <li>Current date and time</li>
      *   <li>Sovereign personality base prompt</li>
+     *   <li>Learned rules from CorrectionLedger</li>
      * </ul>
      */
     public static String buildSystemPrompt(String userName) {
+        return buildSystemPrompt(userName, null);
+    }
+
+    public static String buildSystemPrompt(String userName, com.sovereign.core.memory.CorrectionLedger ledger) {
         String name = (userName != null && !userName.isBlank()) ? userName.trim() : "there";
         String dateTime = java.time.LocalDateTime.now()
                 .format(java.time.format.DateTimeFormatter.ofPattern("EEEE, dd MMM yyyy HH:mm"));
-        return JARVIS_SYSTEM_PROMPT
+        String prompt = JARVIS_SYSTEM_PROMPT
                 + " The user's name is " + name + "."
                 + " Current date and time: " + dateTime + ".";
+        if (ledger != null) {
+            prompt += ledger.formatRulesForPrompt();
+        }
+        return prompt;
     }
 
     /**
@@ -148,7 +164,7 @@ public class ReasoningSDK {
             return "At your service. How may I assist you?";
         }
 
-        String systemPrompt = buildSystemPrompt(userName);
+        String systemPrompt = buildSystemPrompt(userName, correctionLedger);
         if (context != null && !context.isBlank()) {
             systemPrompt += "\n\nTrusted grounding context:\n" + context.trim();
         }
