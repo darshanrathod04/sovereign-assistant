@@ -21,11 +21,14 @@ import com.sovereign.core.react.model.OperatorEvent;
 import com.sovereign.core.react.planner.GoalDecomposer;
 import com.sovereign.core.react.recovery.CausalErrorRecoveryEngine;
 import com.sovereign.core.tools.FileSystemTool;
+import com.sovereign.core.tools.GitHubTool;
 import com.sovereign.core.tools.LogAnalyzerTool;
 import com.sovereign.core.tools.MultimodalIngestTool;
 import com.sovereign.core.tools.ProcessControlTool;
 import com.sovereign.core.tools.ScreenCaptureTool;
 import com.sovereign.core.tools.ShellExecutionTool;
+import com.sovereign.core.tools.WebPageReaderTool;
+import com.sovereign.core.tools.WebSearchTool;
 import com.sovereign.core.voice.MicrophoneAudioCapture;
 import com.sovereign.core.voice.SpeechToTextAdapter;
 import com.sovereign.core.voice.TextToSpeechSynthesizer;
@@ -67,6 +70,9 @@ public class SovereignReplRunner {
     private final MultimodalIngestTool multimodalTool;
     private final ScreenCaptureTool screenCaptureTool;
     private final LogAnalyzerTool logAnalyzerTool;
+    private final WebSearchTool webSearchTool;
+    private final WebPageReaderTool webReaderTool;
+    private final GitHubTool gitHubTool;
 
     private final UserMemoryProfile userProfile;
     private final ProceduralSkillStore skillStore;
@@ -109,6 +115,9 @@ public class SovereignReplRunner {
         this.multimodalTool = new MultimodalIngestTool();
         this.screenCaptureTool = new ScreenCaptureTool(multimodalTool);
         this.logAnalyzerTool = new LogAnalyzerTool();
+        this.webSearchTool = new WebSearchTool();
+        this.webReaderTool = new WebPageReaderTool();
+        this.gitHubTool = new GitHubTool();
         this.userProfile = UserMemoryProfile.createDefault();
         this.skillStore = ProceduralSkillStore.createDefault();
         this.contextIndexer = new WorkspaceContextIndexer();
@@ -301,6 +310,59 @@ public class SovereignReplRunner {
             } catch (Exception e) {
                 System.err.println("Failed to analyze log: " + e.getMessage());
                 return 1;
+            }
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("search") || args[startIndex].equalsIgnoreCase("web"))) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Usage: sovereign search \"<query>\"");
+                return 1;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = startIndex + 1; i < args.length; i++) {
+                if (!sb.isEmpty()) sb.append(" ");
+                sb.append(args[i]);
+            }
+            var res = webSearchTool.search(sb.toString().trim());
+            System.out.println(res.formatSummary());
+            return res.success() ? 0 : 1;
+        }
+
+        if (startIndex < args.length && (args[startIndex].equalsIgnoreCase("fetch") || args[startIndex].equalsIgnoreCase("browse"))) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Usage: sovereign fetch <url>");
+                return 1;
+            }
+            String url = args[startIndex + 1].trim();
+            var res = webReaderTool.fetchPage(url);
+            System.out.println(res.formatSummary(2000));
+            return res.success() ? 0 : 1;
+        }
+
+        if (startIndex < args.length && args[startIndex].equalsIgnoreCase("github")) {
+            if (startIndex + 1 >= args.length) {
+                System.err.println("Usage: sovereign github <search|issues> <args>");
+                return 1;
+            }
+            String sub = args[startIndex + 1].toLowerCase();
+            if (sub.equals("search")) {
+                String q = startIndex + 2 < args.length ? args[startIndex + 2] : "sovereign";
+                var res = gitHubTool.searchRepos(q, 5);
+                System.out.println(res.summary());
+                return res.success() ? 0 : 1;
+            } else if (sub.equals("issues")) {
+                if (startIndex + 2 >= args.length) {
+                    System.err.println("Usage: sovereign github issues <owner/repo>");
+                    return 1;
+                }
+                String[] parts = args[startIndex + 2].split("/");
+                if (parts.length < 2) {
+                    System.err.println("Invalid format. Use: owner/repo");
+                    return 1;
+                }
+                var res = gitHubTool.getIssues(parts[0], parts[1], 5);
+                System.out.println(res.summary());
+                return res.success() ? 0 : 1;
             }
         }
 
@@ -651,6 +713,30 @@ public class SovereignReplRunner {
                     System.out.println("Recommendation  : " + res.suggestion());
                 } catch (Exception e) {
                     System.err.println("Failed to analyze log: " + e.getMessage());
+                }
+            } else if (line.startsWith("search ") || line.startsWith("web ")) {
+                String q = line.startsWith("search ") ? line.substring(7).trim() : line.substring(4).trim();
+                var res = webSearchTool.search(q);
+                System.out.println(res.formatSummary());
+            } else if (line.startsWith("fetch ") || line.startsWith("browse ")) {
+                String u = line.startsWith("fetch ") ? line.substring(6).trim() : line.substring(7).trim();
+                var res = webReaderTool.fetchPage(u);
+                System.out.println(res.formatSummary(2000));
+            } else if (line.startsWith("github ")) {
+                String rest = line.substring(7).trim();
+                if (rest.startsWith("search ")) {
+                    var res = gitHubTool.searchRepos(rest.substring(7).trim(), 5);
+                    System.out.println(res.summary());
+                } else if (rest.startsWith("issues ")) {
+                    String[] parts = rest.substring(7).trim().split("/");
+                    if (parts.length >= 2) {
+                        var res = gitHubTool.getIssues(parts[0], parts[1], 5);
+                        System.out.println(res.summary());
+                    } else {
+                        System.err.println("Usage: github issues <owner/repo>");
+                    }
+                } else {
+                    System.err.println("Usage: github <search|issues> <args>");
                 }
             } else if (line.equalsIgnoreCase("keys") || line.equalsIgnoreCase("sovereign keys")) {
                 printKeys();
@@ -1156,6 +1242,9 @@ public class SovereignReplRunner {
               ingest <path> [prompt]  Analyze image, PDF, or document via multimodal AI
               screenshot [prompt]     Capture desktop screen and analyze with Gemini Vision
               analyze-log <path>      Diagnose build errors, stack traces, and test failures
+              search <query>          Zero-cost web search via DuckDuckGo Instant API
+              fetch <url>             Scrape and read web page / documentation text
+              github <search|issues>  Inspect GitHub repositories and open issues
               help                    Show this help message
               exit / quit             Exit REPL
             """);
